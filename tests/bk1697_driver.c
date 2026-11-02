@@ -1286,7 +1286,7 @@ static void check_range(uint32_t key, double maximum)
 static void test_upper_voltage_setting(void)
 {
 	static const double bad[] = { 0, 0.9, 40.3, 12.34, NAN, INFINITY, -INFINITY };
-	unsigned int i, count;
+	unsigned int i, count, opens, closes;
 	setup();
 	count = wire.commands->len;
 	for (i = 0; i < G_N_ELEMENTS(bad); i++)
@@ -1303,12 +1303,36 @@ static void test_upper_voltage_setting(void)
 	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GOVP00");
 	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
 	check_range(SR_CONF_VOLTAGE_TARGET, 15.0);
-	/* Neither ACK nor the requested value may fabricate the actual ceiling. */
+	/* A valid but mismatched readback is a failed SET, not a transport fault. */
 	wire.ignore_setting = TRUE;
+	count = wire.commands->len;
+	opens = wire.opens;
+	closes = wire.closes;
 	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
-		g_variant_new_double(16.0)), ==, SR_OK);
+		g_variant_new_double(16.0)), !=, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "SOVP00160");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GOVP00");
 	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
+	check_range(SR_CONF_VOLTAGE_TARGET, 15.0);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
 	wire.ignore_setting = FALSE;
+	/* The next SET works without reopening; compare canonical wire precision. */
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double((double)16.1f)), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "SOVP00161");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GOVP00");
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 16.1);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpuint(wire.opens, ==, opens);
+	g_assert_cmpuint(wire.closes, ==, closes);
+	g_test_message("ignored SOVP: 3 commands, actual 15.0 V retained; next SET: "
+		"3 commands, canonical 16.1 V confirmed; opens/closes unchanged (%u/%u)",
+		opens, closes);
 	/* Front-panel changes must be queried even while GOVP is cache-fresh. */
 	wire.upper_voltage_count = 140;
 	count = wire.commands->len;

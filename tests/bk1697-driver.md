@@ -7,7 +7,8 @@ supplies serial and session-source seam declarations only.
 
 ## Build and run
 
-Current GOVP/SOVP baseline: branch `arch-bkprecision-1697`, HEAD `a46f4d8e`.
+Review-fix baseline: branch `arch-bkprecision-1697`, HEAD `41b9dcc6`.
+Original GOVP/SOVP baseline: `a46f4d8e`.
 The older simplification/timing evidence below predates this addition. The existing
 `build-performance` is frozen for parent measurements and was **not rebuilt or
 modified**. This work uses:
@@ -59,7 +60,16 @@ Bounds: threshold **1.0..GMAX voltage**, step **0.1 V**, including factory
 **min(40 V, GMAX voltage, GOVP)**. Target writes refresh actual GOVP first;
 threshold writes refresh GETS and reject a new ceiling below the current target.
 Neither rejection changes the ceiling, target or output. SOVP ACK must be followed
-by actual GOVP readback. No requested value is fabricated into the cache.
+by actual GOVP readback. A valid actual value differing from canonical requested
+counts/10.0 now returns `SR_ERR` with requested/actual voltage in the log. The
+actual snapshot stays cached, with no retry, communication-fault latch or forced
+reopen. This new mismatch rule applies only to threshold SET, not old V/I setters.
+No requested value is fabricated into the cache.
+
+Polling now uses a small explicit static sequence
+`GETD, GETS, GETD, GPAL, GETD, GOVP` and `G_N_ELEMENTS` wrap, rather than enum
+arithmetic or a hard-coded modulus. Status age-gating, GETD fallback, limits
+and sample accounting are unchanged.
 
 ### Red/green evidence
 
@@ -120,17 +130,65 @@ Measured minima were **1.053/1.023 ms**; ten other gaps totaled **0.027 ms**
 GETS/SOVP/GOVP sequence totaled **0.022 ms** in gaps (<5 ms), rejecting even a
 SOVP-only 1 ms wait.
 
-### Remaining risks
+### Review-fix red/green (`41b9dcc6`)
 
-SOVP post-ACK settling has **not** been measured physically. There is deliberately
-**no SOVP delay** pending parent direct 0 vs 1 ms measurements; only the existing
-measured VOLT/CURR 1 ms waits remain. A dropped GOVP reply faults rather than
+The existing public `/bk1697/upper-voltage-setting` regression was changed first
+so an ignored SOVP requesting 16 V with valid actual 15 V must fail SET. RED
+returned `SR_OK` and failed the non-success assertion (exit 134), recorded in
+`build-simplified/govp-mismatch-red.log`. After the fix, the same test passes in
+`govp-mismatch-green.log`: exactly **3 commands** (GETS/SOVP/GOVP), actual **15 V**
+retained in the cache and target LIST, and zero extra getter commands. The next
+SET uses `(double)16.1f` and succeeds against canonical **16.1 V** readback with
+exactly **3 commands**, proving wire-precision comparison and no retry. Open/close
+counters remain **2/1** across both calls: no reopen or fault recovery is needed.
+
+Reproduction from the repository root:
+
+```sh
+# RED uses the changed test against the preceding implementation/archive.
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-setting
+# GREEN after rebuilding the fix:
+make -C build-simplified -j4
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-setting
+```
+
+Final review-fix rerun: **43/43 integration**, **6/6 parser/setting**, and
+**76/76 upstream Check checks**, zero failures/errors; `git diff --check` passes.
+Logs: `build-simplified/govp-review-{build,driver-tests,check}.log`. Existing timing
+checks are unchanged: VOLT/CURR minimum gaps **1.054/1.053 ms**, ten other gaps
+**0.029 ms** total; 24 GETS/SOVP/GOVP gaps **0.023 ms** total. The explicit polling
+sequence retains live-status refresh, exact sample accounting and lifecycle tests.
+The rebuilt shared/static libraries in `build-simplified/.libs/` are ready for
+parent packaging. No package changes, hardware actions, agents or commits were used.
+
+### Parent hardware/GUI evidence and remaining limits
+
+Logs read from workspace-root `bk1697/libsigrok/` (no hardware accessed here):
+
+- `hardware-ovp-timing.log`: direct SOVP->GOVP **30/30 at zero gap**,
+  **30/30 at 1 ms**, alternating 5/6 V; 40.2 V restored, GETS `042350`
+  and output OFF preserved. **No SOVP delay is added**. Only measured
+  VOLT/CURR 1 ms waits remain.
+- `hardware-ovp-driver.log`: actual driver limits 5/6/5 V with matching actual
+  readbacks and restoration to 40.2 V; software ceiling/target/range/step/finite
+  guards rejected unsafe requests. Target **4.2 V**, current limit **3.5 A**
+  and output **OFF** were preserved.
+- `gui-ovp-control-heartbeat.log`: actual SmuView **0.0.4** numeric OVP field
+  enabled, min **1**, max **40.2**, step **0.1 V**; displayed
+  **40.2 -> 5 -> 6 -> 40.2 V**. Enable toggle unsupported/disabled
+  (`toggle_enabled=false`), OVP LED inactive, startup **713.776 ms (~714 ms)**.
+
+These parent results precede this review fix; no new physical mismatch or GUI
+retest was performed. The timing trials are evidence for this unit, not an
+exhaustive firmware guarantee. A dropped GOVP reply still faults rather than
 retrying SOVP. Front-panel changes between a safety prequery and the write cannot
 be atomic. Active snapshots can lag until the normal >=500 ms status refresh;
-idle TTL stays 250 ms. Physical tracking-trip behavior, electrical accuracy,
-loaded CC scaling and GUI behavior remain parent-owned verification.
+idle TTL stays 250 ms. Physical tracking-trip behavior, electrical accuracy and
+loaded CC scaling still require separate verification.
 
-Review was performed locally against the working-tree diff from `a46f4d8e`,
+Review was performed locally against the working-tree diff from `41b9dcc6`,
 using `HACKING` and the supplied spec; no agents or commits were used.
 
 ## Test-first evidence
@@ -273,7 +331,8 @@ during a setter; groups are not globally atomic. Slow serial I/O still blocks
 the session thread and may delay status freshness. Hardware behavior, loaded
 current/CC scaling, electrical accuracy and arbitrary thread schedules remain
 unverified by this offline work. Parent-reported GUI/performance measurements
-are attributed in the driver README; final physical OVP/UI testing is parent-owned. Two simultaneous physical devices are not emulated;
+are attributed in the driver README and the hardware/GUI evidence section above;
+physical tracking-trip activation remains parent-owned. Two simultaneous physical devices are not emulated;
 per-device key registration and same-fd timer coexistence are tested directly.
 
 Package integration and master porting remain parent-owned. No hardware,
