@@ -99,6 +99,78 @@ SR_PRIV int bk1697_probe(const struct sr_dev_inst *sdi)
 	return bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
 }
 
+/* Called with the wire mutex held. Claim END once, including close, which
+ * cannot use sr_dev_acquisition_stop() after sdi becomes inactive. */
+SR_PRIV int bk1697_stop_locked(const struct sr_dev_inst *sdi, gboolean *end)
+{
+	struct dev_context *devc = sdi->priv;
+
+	*end = FALSE;
+	if (!devc->active)
+		return SR_OK;
+	devc->active = FALSE;
+	devc->stopping = TRUE;
+	/* If a packet is currently in a user callback, defer END until it
+	 * unwinds. Otherwise another thread could deliver END before that
+	 * packet reaches all callbacks. stopping blocks restart until END. */
+	*end = !devc->sending;
+	return serial_source_remove(sdi->session, sdi->conn);
+}
+
+SR_PRIV void bk1697_send_end(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+
+	/* Session callbacks may re-enter stop/close/configuration. */
+	std_session_send_df_end(sdi);
+	g_mutex_lock(&devc->mutex);
+	devc->stopping = FALSE;
+	g_mutex_unlock(&devc->mutex);
+}
+
+/* Reserve one packet under the wire mutex, but never hold it across a
+ * session callback. A stopped/restarted acquisition cannot inherit a sample
+ * from a previous callback generation. */
+SR_PRIV gboolean bk1697_send_begin(const struct sr_dev_inst *sdi, uint64_t generation)
+{
+	struct dev_context *devc = sdi->priv;
+	gboolean send;
+
+	g_mutex_lock(&devc->mutex);
+	send = devc->active && devc->generation == generation && !devc->sending;
+	if (send)
+		devc->sending = TRUE;
+	g_mutex_unlock(&devc->mutex);
+	return send;
+}
+
+SR_PRIV void bk1697_send_done(const struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	gboolean end;
+
+	g_mutex_lock(&devc->mutex);
+	devc->sending = FALSE;
+	end = devc->stopping;
+	g_mutex_unlock(&devc->mutex);
+	if (end)
+		bk1697_send_end(sdi);
+}
+
+SR_PRIV int bk1697_acquisition_stop(struct sr_dev_inst *sdi)
+{
+	struct dev_context *devc = sdi->priv;
+	gboolean end;
+	int ret;
+
+	g_mutex_lock(&devc->mutex);
+	ret = bk1697_stop_locked(sdi, &end);
+	g_mutex_unlock(&devc->mutex);
+	if (end)
+		bk1697_send_end(sdi);
+	return ret;
+}
+
 SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 {
 	struct sr_dev_inst *sdi;
@@ -112,7 +184,8 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	struct sr_channel *ch;
 	GSList *l;
 	float value;
-	gboolean stop;
+	gboolean stop, end;
+	uint64_t generation;
 	int ret;
 
 	(void)fd;
@@ -120,20 +193,35 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	sdi = cb_data;
 	devc = sdi->priv;
 	g_mutex_lock(&devc->mutex);
+	if (!devc->active) {
+		g_mutex_unlock(&devc->mutex);
+		return FALSE;
+	}
+	generation = devc->generation;
 	stop = sr_sw_limits_check(&devc->limits);
 	ret = stop ? SR_ERR : bk1697_query(sdi, "GETD00", BK1697_MEASUREMENT, &r);
+	end = FALSE;
+	if (ret != SR_OK)
+		bk1697_stop_locked(sdi, &end);
 	g_mutex_unlock(&devc->mutex);
-	if (ret != SR_OK) {
-		sr_dev_acquisition_stop(sdi);
+	if (end)
+		bk1697_send_end(sdi);
+	if (ret != SR_OK)
 		return TRUE;
-	}
 
-	/* Do not hold the wire mutex across session callbacks. */
+	/* Each send can synchronously stop/close acquisition via user callbacks.
+	 * Recheck state before every subsequent packet, without holding the
+	 * wire mutex during any send. */
+	if (!bk1697_send_begin(sdi, generation))
+		return TRUE;
 	std_session_send_df_frame_begin(sdi);
+	bk1697_send_done(sdi);
 	for (l = sdi->channels; l; l = l->next) {
 		ch = l->data;
 		if (!ch->enabled)
 			continue;
+		if (!bk1697_send_begin(sdi, generation))
+			return TRUE;
 		sr_analog_init(&analog, &encoding, &meaning, &spec,
 			ch->index == 0 ? r.voltage_digits : r.current_digits);
 		value = ch->index == 0 ? r.voltage : r.current;
@@ -147,15 +235,29 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 		packet.payload = &analog;
 		sr_session_send(sdi, &packet);
 		g_slist_free(meaning.channels);
+		bk1697_send_done(sdi);
 	}
+	if (!bk1697_send_begin(sdi, generation))
+		return TRUE;
 	std_session_send_df_frame_end(sdi);
+	bk1697_send_done(sdi);
+	if (!bk1697_send_begin(sdi, generation))
+		return TRUE;
 	sr_session_send_meta(sdi, SR_CONF_REGULATION,
 		g_variant_new_string(r.cc ? "CC" : "CV"));
+	bk1697_send_done(sdi);
 	g_mutex_lock(&devc->mutex);
+	if (!devc->active || devc->generation != generation) {
+		g_mutex_unlock(&devc->mutex);
+		return TRUE;
+	}
 	sr_sw_limits_update_samples_read(&devc->limits, 1);
 	stop = sr_sw_limits_check(&devc->limits);
-	g_mutex_unlock(&devc->mutex);
+	end = FALSE;
 	if (stop)
-		sr_dev_acquisition_stop(sdi);
+		bk1697_stop_locked(sdi, &end);
+	g_mutex_unlock(&devc->mutex);
+	if (end)
+		bk1697_send_end(sdi);
 	return TRUE;
 }
