@@ -24,17 +24,21 @@ static struct {
 	GPtrArray *commands;
 	GString *rx;
 	gboolean opened, wide, output_data, enabled;
-	gboolean ignore_setting, fail_readback;
+	gboolean ignore_setting, fail_readback, bad_measurement, bad_panel, over_voltage;
 	gboolean hold, entered, contender, release, configured;
 	unsigned int opens, closes, flushes, adds, removes, prereads;
-	unsigned int headers, ends, frames, frame_ends, analogs, metas;
+	unsigned int serial_sources, timer_calls;
+	sr_receive_data_callback timer_cb;
+	void *timer_data;
+	unsigned int headers, ends, frames, frame_ends, analogs, metas, ovp_metas;
 	unsigned int voltage_count, current_count;
 	double voltage, current;
 	char maximum[7];
 	enum injection inject;
-	gint64 completed, opened_at;
+	gint64 completed;
 	gboolean measure_gaps;
-	gint64 max_command_gap;
+	gint64 max_command_gap, voltage_readback_min, current_readback_min, other_gap_total;
+	unsigned int voltage_readbacks, current_readbacks;
 	gint64 last_gets, last_gpal, gets_gap, gpal_gap;
 } wire;
 static struct sr_context *ctx;
@@ -42,9 +46,10 @@ static struct sr_dev_driver *driver;
 static struct sr_dev_inst *device;
 static struct sr_session *session;
 static gboolean reentrant, stream_ended, close_packet, repeat_stop, live_status;
-static gboolean observer_ended;
+static gboolean observer_ended, setter_fault, setter_fault_readback;
 static unsigned int observer_ends;
 static int stop_packet;
+static unsigned int ovp_mode, ovp_stage;
 
 int __wrap_serial_open(struct sr_serial_dev_inst *serial, int flags)
 {
@@ -53,7 +58,6 @@ int __wrap_serial_open(struct sr_serial_dev_inst *serial, int flags)
 	g_assert(!(wire.opened));
 	wire.opened = TRUE;
 	wire.opens++;
-	wire.opened_at = g_get_monotonic_time();
 	return SR_OK;
 }
 
@@ -70,8 +74,7 @@ int __wrap_serial_flush(struct sr_serial_dev_inst *serial)
 {
 	(void)serial;
 	g_assert(wire.opened);
-	/* Reconnect must quarantine delayed responses before flushing them. */
-	g_assert_cmpint(g_get_monotonic_time() - wire.opened_at, >=, 2000000);
+	/* Discard queued input on explicit open, never within a transaction. */
 	g_string_truncate(wire.rx, 0);
 	wire.completed = 0;
 	wire.flushes++;
@@ -104,15 +107,28 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 	const void *buf, size_t count, unsigned int timeout_ms)
 {
 	char *command, panel[73];
+	gint64 gap;
 	(void)serial;
 	g_assert(wire.opened);
 	g_assert_cmpuint(timeout_ms, <=, 500);
 	g_assert_cmpuint(count, >, 1);
 	g_assert_cmpint(((const char *)buf)[count - 1], ==, '\r');
 	g_assert_cmpuint(wire.rx->len, ==, 0);
-	if (wire.measure_gaps && wire.completed)
-		wire.max_command_gap = MAX(wire.max_command_gap,
-			g_get_monotonic_time() - wire.completed);
+	if (wire.measure_gaps && wire.completed) {
+		gap = g_get_monotonic_time() - wire.completed;
+		wire.max_command_gap = MAX(wire.max_command_gap, gap);
+		if (g_str_has_prefix(g_ptr_array_index(wire.commands, wire.commands->len - 1), "VOLT00") &&
+			count == 7 && !memcmp(buf, "GETS00\r", 7)) {
+			wire.voltage_readback_min = MIN(wire.voltage_readback_min, gap);
+			wire.voltage_readbacks++;
+		} else if (g_str_has_prefix(g_ptr_array_index(wire.commands, wire.commands->len - 1), "CURR00") &&
+			count == 7 && !memcmp(buf, "GETS00\r", 7)) {
+			wire.current_readback_min = MIN(wire.current_readback_min, gap);
+			wire.current_readbacks++;
+		} else {
+			wire.other_gap_total += gap;
+		}
+	}
 	command = g_strndup(buf, count - 1);
 	g_ptr_array_add(wire.commands, command);
 	if (wire.inject == SHORT_WRITE || wire.inject == WRITE_ERROR) {
@@ -154,14 +170,16 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 			wire.inject = READ_ERROR;
 	}
 	else if (!strcmp(command, "GETD00"))
-		g_string_assign(wire.rx, wire.wide ? "123405671\rOK\r" : "1230560\rOK\r");
+		g_string_assign(wire.rx, wire.bad_measurement ? "4030000\rOK\r" :
+			wire.wide ? "123405671\rOK\r" : "1230560\rOK\r");
 	else if (!strcmp(command, "GPAL00")) {
 		gint64 now = g_get_monotonic_time();
 		if (wire.last_gpal)
 			wire.gpal_gap = MAX(wire.gpal_gap, now - wire.last_gpal);
 		wire.last_gpal = now;
 		memset(panel, '0', 68);
-		memcpy(panel + 65, wire.enabled ? "01" : "10", 2);
+		panel[64] = wire.over_voltage ? '0' : '1';
+		memcpy(panel + 65, wire.bad_panel ? "00" : wire.enabled ? "01" : "10", 2);
 		memcpy(panel + 68, "\rOK\r", 5);
 		g_string_assign(wire.rx, panel);
 	} else if (g_str_has_prefix(command, "VOLT00")) {
@@ -222,20 +240,57 @@ int __wrap_serial_source_add(struct sr_session *s,
 	struct sr_serial_dev_inst *serial, int events, int timeout,
 	sr_receive_data_callback cb, void *data)
 {
+	(void)s;
 	(void)serial;
-	g_assert_cmpint(events, ==, G_IO_IN);
-	g_assert_cmpint(timeout, ==, 10);
-	wire.adds++;
-	/* Use the real session event loop, with a timer instead of a serial fd. */
-	return sr_session_source_add(s, -1, 0, timeout, cb, data);
+	(void)events;
+	(void)timeout;
+	(void)cb;
+	(void)data;
+	wire.serial_sources++;
+	/* Never hide a serial-readiness source behind a fake timer. */
+	return SR_ERR;
 }
 
 int __wrap_serial_source_remove(struct sr_session *s,
 	struct sr_serial_dev_inst *serial)
 {
+	(void)s;
 	(void)serial;
+	return SR_ERR;
+}
+
+int __real_sr_session_fd_source_add(struct sr_session *s, void *key,
+	gintptr fd, int events, int timeout, sr_receive_data_callback cb, void *data);
+int __real_sr_session_source_remove_internal(struct sr_session *s, void *key);
+
+static int timer_dispatch(int fd, int revents, void *data)
+{
+	g_assert_cmpint(fd, ==, -1);
+	g_assert_cmpint(revents, ==, 0);
+	wire.timer_calls++;
+	return wire.timer_cb(fd, revents, data);
+}
+
+int __wrap_sr_session_fd_source_add(struct sr_session *s, void *key,
+	gintptr fd, int events, int timeout, sr_receive_data_callback cb, void *data)
+{
+	g_assert(key == data);
+	g_assert(data == device);
+	g_assert_cmpint(fd, ==, -1);
+	g_assert_cmpint(events, ==, 0);
+	g_assert_cmpint(timeout, ==, 10);
+	wire.adds++;
+	wire.timer_cb = cb;
+	wire.timer_data = data;
+	return __real_sr_session_fd_source_add(s, key, fd, events, timeout,
+		timer_dispatch, data);
+}
+
+int __wrap_sr_session_source_remove_internal(struct sr_session *s, void *key)
+{
+	g_assert(key == wire.timer_data);
 	wire.removes++;
-	return sr_session_source_remove(s, -1);
+	return __real_sr_session_source_remove_internal(s, key);
 }
 
 static int set(uint32_t key, GVariant *value)
@@ -326,8 +381,11 @@ static void setup(void)
 	close_packet = FALSE;
 	repeat_stop = FALSE;
 	observer_ended = FALSE;
+	setter_fault = FALSE;
+	setter_fault_readback = FALSE;
 	observer_ends = 0;
 	stop_packet = -1;
+	ovp_mode = ovp_stage = 0;
 }
 
 static void teardown(void)
@@ -423,6 +481,9 @@ static void assert_latched(void)
 	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), !=, SR_OK);
 	g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_CURRENT, &value), !=, SR_OK);
 	g_assert((value) == NULL);
+	g_assert_cmpint(sr_config_get(driver, device, NULL,
+		SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE, &value), !=, SR_OK);
+	g_assert(value == NULL);
 	g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
 	g_assert_cmpuint(wire.commands->len, ==, count);
 	g_assert_cmpuint(wire.prereads, ==, prereads);
@@ -539,12 +600,39 @@ static void feed(const struct sr_dev_inst *sdi,
 	case SR_DF_FRAME_BEGIN: wire.frames++; break;
 	case SR_DF_FRAME_END: wire.frame_ends++; break;
 	case SR_DF_META:
-		wire.metas++;
 		meta = packet->payload;
 		g_assert_cmpuint(g_slist_length(meta->config), ==, 1);
 		config = meta->config->data;
-		g_assert_cmpuint(config->key, ==, SR_CONF_REGULATION);
-		g_assert_cmpstr(g_variant_get_string(config->data, NULL), ==, wire.wide ? "CC" : "CV");
+		if (config->key == SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE) {
+			unsigned int count = wire.commands->len;
+			wire.ovp_metas++;
+			g_assert_cmpint(g_variant_get_boolean(config->data), ==, wire.over_voltage);
+			value = get(SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE);
+			g_assert_cmpint(g_variant_get_boolean(value), ==, wire.over_voltage);
+			g_variant_unref(value);
+			value = get(SR_CONF_ENABLED);
+			g_assert_cmpint(g_variant_get_boolean(value), ==, wire.enabled);
+			g_variant_unref(value);
+			g_assert_cmpuint(wire.commands->len, ==, count);
+			if (ovp_mode) {
+				if (ovp_stage == 0) {
+					g_assert(wire.over_voltage);
+					ovp_stage = 1;
+					wire.over_voltage = FALSE;
+				} else {
+					g_assert(!wire.over_voltage);
+					ovp_stage = 2;
+				}
+				if (ovp_mode == 3)
+					g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+				else if (ovp_mode == 2 || ovp_stage == 2)
+					g_assert_cmpint(sr_session_stop(session), ==, SR_OK);
+			}
+		} else {
+			wire.metas++;
+			g_assert_cmpuint(config->key, ==, SR_CONF_REGULATION);
+			g_assert_cmpstr(g_variant_get_string(config->data, NULL), ==, wire.wide ? "CC" : "CV");
+		}
 		break;
 	case SR_DF_ANALOG:
 		/* Keep acquisition active until the contending settings/readbacks
@@ -575,6 +663,18 @@ static void feed(const struct sr_dev_inst *sdi,
 		}
 		break;
 	default: g_error("Unexpected packet type %d", packet->type);
+	}
+	if (setter_fault && packet->type == SR_DF_ANALOG) {
+		setter_fault = FALSE;
+		if (setter_fault_readback)
+			wire.fail_readback = TRUE;
+		else
+			wire.inject = READ_ERROR;
+		g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), !=, SR_OK);
+		/* Source removal is immediate, but END must wait until this packet
+		 * has reached the later observer callback. */
+		g_assert_cmpuint(wire.removes, ==, 1);
+		g_assert_cmpuint(wire.ends, ==, 0);
 	}
 	if (live_status && packet->type == SR_DF_FRAME_END && wire.frames >= 60) {
 		unsigned int count = wire.commands->len;
@@ -860,7 +960,8 @@ static gpointer snapshot_getter(gpointer unused)
 {
 	static const uint32_t keys[] = { SR_CONF_VOLTAGE, SR_CONF_CURRENT,
 		SR_CONF_REGULATION, SR_CONF_VOLTAGE_TARGET, SR_CONF_CURRENT_LIMIT,
-		SR_CONF_ENABLED, SR_CONF_CONN, SR_CONF_LIMIT_SAMPLES };
+		SR_CONF_ENABLED, SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE,
+		SR_CONF_CONN, SR_CONF_LIMIT_SAMPLES };
 	GVariant *value;
 	gint64 start;
 	unsigned int i, count;
@@ -1088,7 +1189,7 @@ static void test_no_command_spacing(void)
 {
 	static const char *expected[] = {
 		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00",
-		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00"
+		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT001", "GPAL00"
 	};
 	unsigned int start, i;
 	gint64 began, elapsed;
@@ -1096,11 +1197,12 @@ static void test_no_command_spacing(void)
 	setup();
 	start = wire.commands->len;
 	wire.measure_gaps = TRUE;
+	wire.voltage_readback_min = wire.current_readback_min = G_MAXINT64;
 	began = g_get_monotonic_time();
 	for (i = 0; i < 2; i++) {
 		g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
 		g_assert_cmpint(set(SR_CONF_CURRENT_LIMIT, g_variant_new_double(0.7)), ==, SR_OK);
-		g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), ==, SR_OK);
+		g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(i == 0)), ==, SR_OK);
 	}
 	elapsed = g_get_monotonic_time() - began;
 	wire.measure_gaps = FALSE;
@@ -1119,10 +1221,260 @@ static void test_no_command_spacing(void)
 	teardown();
 }
 
+static void test_ovp_getter(void)
+{
+	GVariant *value;
+	unsigned int count;
+	setup();
+	count = wire.commands->len;
+	value = get(SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE);
+	g_assert(!g_variant_get_boolean(value));
+	g_variant_unref(value);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	wire.over_voltage = TRUE;
+	g_usleep(260000);
+	value = get(SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE);
+	g_assert(g_variant_get_boolean(value));
+	g_variant_unref(value);
+	value = get(SR_CONF_ENABLED);
+	g_assert(!g_variant_get_boolean(value));
+	g_variant_unref(value);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	wire.over_voltage = FALSE;
+	g_usleep(260000);
+	value = get(SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE);
+	g_assert(!g_variant_get_boolean(value));
+	g_variant_unref(value);
+	teardown();
+}
+
+static void test_ovp_poll(gconstpointer data)
+{
+	GVariant *value;
+	unsigned int count;
+	setup();
+	value = get(SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE);
+	g_assert(!g_variant_get_boolean(value));
+	g_variant_unref(value);
+	new_session(0, 1800); /* Bounded even if metadata never arrives (RED). */
+	ovp_mode = GPOINTER_TO_UINT(data);
+	wire.over_voltage = TRUE;
+	g_assert_cmpint(sr_session_datafeed_callback_add(session, observe_order, NULL), ==, SR_OK);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(ovp_stage, ==, ovp_mode == 1 ? 2 : 1);
+	g_assert_cmpuint(wire.ovp_metas, ==, ovp_mode == 1 ? 2 : 1);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpuint(observer_ends, ==, 1);
+	g_assert_cmpuint(wire.frames, ==, wire.frame_ends);
+	g_assert_cmpuint(wire.metas, ==, wire.frames);
+	g_assert_cmpuint(wire.adds, ==, wire.removes);
+	if (ovp_mode == 3) {
+		count = wire.commands->len;
+		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+		probe_at(count);
+	}
+	teardown();
+}
+
+static void test_setting_readback_delay(void)
+{
+	/* Same 12 actual commands as the no-global-spacing regression. */
+	test_no_command_spacing();
+	g_test_message("VOLT->GETS minimum %.3f ms; CURR->GETS minimum %.3f ms; eight other gaps total %.3f ms",
+		wire.voltage_readback_min / 1000.0, wire.current_readback_min / 1000.0,
+		wire.other_gap_total / 1000.0);
+	g_assert_cmpuint(wire.voltage_readbacks, ==, 2);
+	g_assert_cmpint(wire.voltage_readback_min, >=, 1000);
+	g_assert_cmpuint(wire.current_readbacks, ==, 2);
+	g_assert_cmpint(wire.current_readback_min, >=, 1000);
+	/* Generous aggregate scheduling slack, but a blanket 1 ms gap fails. */
+	g_assert_cmpint(wire.other_gap_total, <, 5000);
+}
+
+static gpointer local_limits_thread(gpointer unused)
+{
+	GVariant *value;
+	gint64 start;
+	unsigned int count;
+	(void)unused;
+	g_mutex_lock(&wire.lock);
+	while (!wire.entered)
+		g_cond_wait(&wire.cond, &wire.lock);
+	count = wire.commands->len;
+	g_mutex_unlock(&wire.lock);
+	start = g_get_monotonic_time();
+	g_assert_cmpint(set(SR_CONF_LIMIT_SAMPLES, g_variant_new_uint64(2)), ==, SR_OK);
+	g_assert_cmpint(set(SR_CONF_LIMIT_MSEC, g_variant_new_uint64(5000)), ==, SR_OK);
+	value = get(SR_CONF_LIMIT_SAMPLES);
+	g_assert_cmpuint(g_variant_get_uint64(value), ==, 2);
+	g_variant_unref(value);
+	value = get(SR_CONF_LIMIT_MSEC);
+	g_assert_cmpuint(g_variant_get_uint64(value), ==, 5000);
+	g_variant_unref(value);
+	getter_elapsed = g_get_monotonic_time() - start;
+	g_mutex_lock(&wire.lock);
+	getter_commands = wire.commands->len - count;
+	wire.configured = TRUE;
+	g_cond_broadcast(&wire.cond);
+	g_mutex_unlock(&wire.lock);
+	return NULL;
+}
+
+static void test_held_wire_limits(void)
+{
+	GThread *limits, *watchdog;
+	setup();
+	new_session(2, 0);
+	wire.hold = TRUE;
+	limits = g_thread_new("limits", local_limits_thread, NULL);
+	watchdog = g_thread_new("watchdog", snapshot_watchdog, NULL);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_thread_join(limits);
+	g_thread_join(watchdog);
+	g_test_message("held-wire limit set/get: %.3f ms, %u extra commands",
+		getter_elapsed / 1000.0, getter_commands);
+	g_assert_cmpint(getter_elapsed, <, 50000);
+	g_assert_cmpuint(getter_commands, ==, 0);
+	teardown();
+}
+
+static int companion_timer(int fd, int revents, void *data)
+{
+	unsigned int *calls = data;
+	g_assert_cmpint(fd, ==, -1);
+	g_assert_cmpint(revents, ==, 0);
+	(*calls)++;
+	return !wire.ends;
+}
+
+static void test_timer_source(void)
+{
+	unsigned int companion_calls = 0;
+	setup();
+	new_session(0, 100);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	/* Serial readiness must not be substituted by the test harness. */
+	g_assert_cmpuint(wire.serial_sources, ==, 0);
+	/* Another timer with the same fd but a different key coexists in this
+	 * session. In particular the device does not reserve the shared -1 key. */
+	g_assert_cmpint(__real_sr_session_fd_source_add(session, GINT_TO_POINTER(-1),
+		-1, 0, 10, companion_timer, &companion_calls), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.timer_calls, >=, 2);
+	g_assert_cmpuint(wire.timer_calls, <=, 20);
+	g_assert_cmpuint(companion_calls, >=, 2);
+	g_assert_cmpuint(wire.adds, ==, 1);
+	g_assert_cmpuint(wire.removes, ==, 1);
+	g_test_message("timer-only source: %u callbacks, companion %u, balanced removal",
+		wire.timer_calls, companion_calls);
+	teardown();
+}
+
+static void test_callback_setter_fault(gconstpointer data)
+{
+	setup();
+	new_session(2, 0);
+	setter_fault = TRUE;
+	setter_fault_readback = GPOINTER_TO_INT(data);
+	g_assert_cmpint(sr_session_datafeed_callback_add(session, observe_order, NULL), ==, SR_OK);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.analogs, ==, 1);
+	g_assert_cmpuint(wire.frames, ==, 1);
+	g_assert_cmpuint(wire.frame_ends, ==, 0);
+	g_assert_cmpuint(wire.metas, ==, 0);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpuint(observer_ends, ==, 1);
+	assert_latched();
+	wire.fail_readback = FALSE;
+	reconnect();
+	teardown();
+}
+
+static void test_active_setter_fault(void)
+{
+	setup();
+	new_session(2, 0);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	wire.inject = TIMEOUT;
+	g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), !=, SR_OK);
+	/* A frontend need not run another poll to learn the acquisition ended. */
+	g_assert_cmpuint(wire.removes, ==, 1);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.frames, ==, 0);
+	assert_latched();
+	reconnect();
+	teardown();
+}
+
+static void test_late_probe_validation(void)
+{
+	GVariant *value;
+	unsigned int i, count;
+	setup();
+	for (i = 0; i < 2; i++) {
+		g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+		wire.bad_measurement = i == 0;
+		wire.bad_panel = i == 1;
+		count = wire.commands->len;
+		g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
+		g_assert(!wire.opened);
+		g_assert_cmpuint(wire.commands->len, ==, count + (i ? 4 : 3));
+		count = wire.commands->len;
+		value = NULL;
+		g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_VOLTAGE_TARGET, &value), !=, SR_OK);
+		g_assert(value == NULL);
+		g_assert_cmpuint(wire.commands->len, ==, count);
+		wire.bad_measurement = wire.bad_panel = FALSE;
+		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+		g_assert_cmpuint(wire.commands->len, ==, count + 4);
+		probe_at(count);
+		check_double(SR_CONF_VOLTAGE_TARGET, 12);
+	}
+	teardown();
+}
+
+static void test_open_without_delay(void)
+{
+	unsigned int count, flushes;
+	gint64 start, elapsed;
+
+	setup();
+	g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+	g_string_assign(wire.rx, "stale\rOK\r");
+	count = wire.commands->len;
+	flushes = wire.flushes;
+	start = g_get_monotonic_time();
+	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+	elapsed = g_get_monotonic_time() - start;
+	g_assert_cmpuint(wire.flushes, ==, flushes + 1);
+	g_assert_cmpuint(wire.commands->len, ==, count + 4);
+	probe_at(count);
+	g_assert_cmpuint(wire.rx->len, ==, 0);
+	g_test_message("open/flush/probe: %.3f ms", elapsed / 1000.0);
+	g_assert_cmpint(elapsed, <, 80000);
+	teardown();
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	sr_log_loglevel_set(SR_LOG_NONE);
+	g_test_add_data_func("/bk1697/ovp-poll/activate-clear", GUINT_TO_POINTER(1), test_ovp_poll);
+	g_test_add_data_func("/bk1697/ovp-poll/callback-stop", GUINT_TO_POINTER(2), test_ovp_poll);
+	g_test_add_data_func("/bk1697/ovp-poll/callback-close", GUINT_TO_POINTER(3), test_ovp_poll);
+	g_test_add_func("/bk1697/ovp-getter", test_ovp_getter);
+	g_test_add_func("/bk1697/setting-readback-delay", test_setting_readback_delay);
+	g_test_add_func("/bk1697/late-probe-validation", test_late_probe_validation);
+	g_test_add_func("/bk1697/active-setter-fault", test_active_setter_fault);
+	g_test_add_data_func("/bk1697/callback-setter-fault/ack", GINT_TO_POINTER(FALSE), test_callback_setter_fault);
+	g_test_add_data_func("/bk1697/callback-setter-fault/readback", GINT_TO_POINTER(TRUE), test_callback_setter_fault);
+	g_test_add_func("/bk1697/timer-source", test_timer_source);
+	g_test_add_func("/bk1697/held-wire-limits", test_held_wire_limits);
+	g_test_add_func("/bk1697/open-without-delay", test_open_without_delay);
 	g_test_add_func("/bk1697/no-command-spacing", test_no_command_spacing);
 	g_test_add_func("/bk1697/active-setter-snapshot", test_active_setter_snapshot);
 	g_test_add_func("/bk1697/idle-groups", test_idle_groups);

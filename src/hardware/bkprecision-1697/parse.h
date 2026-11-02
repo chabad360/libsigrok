@@ -21,7 +21,7 @@ enum bk1697_reply {
 
 struct bk1697_response {
 	double voltage, current;
-	int cc, enabled;
+	gboolean cc, enabled, ovp_active;
 	int voltage_digits, current_digits;
 };
 

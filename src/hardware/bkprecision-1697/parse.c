@@ -70,6 +70,10 @@ SR_PRIV int bk1697_parse_reply(const char *buf, size_t len, enum bk1697_reply ki
 				if (buf[i] < '0' || buf[i] > '?')
 					return -1;
 			}
+			/* Character 65 (index 64) is the active-low FAULT/OVP lamp. */
+			if (buf[64] != '0' && buf[64] != '1')
+				return -1;
+			r.ovp_active = buf[64] == '0';
 			/* Active-low ON and OFF indicators must be complementary. */
 			if (memcmp(buf + 65, "01", 2) && memcmp(buf + 65, "10", 2))
 				return -1;

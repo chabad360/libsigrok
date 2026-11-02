@@ -108,6 +108,26 @@ static void malformed(void)
 	g_assert_cmpint(bk1697_parse_reply(oversized, sizeof(oversized), BK1697_PANEL, &r), ==, -1);
 }
 
+static void panel_ovp(void)
+{
+	static const char captured[] =
+		"00;?3?4?0;?3?3?3?03?3?3?3?000000000111100863?010>=3?5;11000110011101\rOK\r";
+	struct bk1697_response r;
+	char panel[sizeof(captured)];
+
+	r = complete(captured, BK1697_PANEL);
+	g_assert(!r.ovp_active);
+	/* Synthetic FAULT assertion changes only character 65 (index 64).
+	 * Output bits remain unchanged: a fault does not imply output state. */
+	memcpy(panel, captured, sizeof(panel));
+	panel[64] = '0';
+	r = complete(panel, BK1697_PANEL);
+	g_assert(r.ovp_active);
+	g_assert(!r.enabled);
+	panel[64] = '2';
+	g_assert_cmpint(bk1697_parse_reply(panel, 72, BK1697_PANEL, &r), ==, -1);
+}
+
 static void safe_settings(void)
 {
 	static const double bad_voltage[] = { -1, 0, 0.9, 40.1, 12.34, INFINITY, NAN };
@@ -146,6 +166,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/bk1697/captured-firmware", captured_firmware);
 	g_test_add_func("/bk1697/manual-and-synthetic", manual_and_synthetic);
 	g_test_add_func("/bk1697/malformed", malformed);
+	g_test_add_func("/bk1697/panel-ovp", panel_ovp);
 	g_test_add_func("/bk1697/safe-settings", safe_settings);
 	return g_test_run();
 }

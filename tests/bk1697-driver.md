@@ -1,255 +1,191 @@
-# Offline BK1697 real-driver integration tests
+# Offline BK1697 driver tests — simplified driver
 
-`bk1697_driver.c` links the **real static libsigrok archive** and selects
-`bkprecision-1697` from `sr_driver_list()`. Discovery, configuration, device
-lifecycle, sessions and packet conversion use public APIs. No parser or driver
-source is compiled into this executable and no driver context is inspected.
-The internal header supplies serial seam and session-source prototypes only.
+The integration executable links the real static archive and exercises discovery,
+configuration, sessions, callbacks and lifecycle through public APIs. No driver
+private context is inspected and no hardware is accessed. The internal header
+supplies serial and session-source seam declarations only.
 
-GNU linker `--wrap` replaces exactly eight serial boundary functions:
-`serial_open`, `serial_close`, `serial_flush`, `serial_read_nonblocking`,
-`serial_read_blocking`, `serial_write_blocking`, `serial_source_add`, and
-`serial_source_remove`. The fake serial source delegates to the **real session
-event loop**, using a 10 ms timer instead of a descriptor. The fake
-`/offline/bk1697-no-hardware` connection is never opened. No hardware is needed.
+## Build and run
 
-## Isolated performance build and commands
+Baseline: branch `arch-bkprecision-1697`, HEAD `1a8e652e`. The existing
+`build-performance` is frozen for parent measurements and was **not rebuilt or
+modified**. This work uses:
 
-Commands below run from `/home/mendel/Documents/Projects/drivers/libsigrok-arch`
-on branch `arch-bkprecision-1697`, starting at `66af36e2`. The build enables only
-BK1697 and demo, with C++ bindings off. It does not change package definitions.
-The local Check dependency already exists outside this source tree.
+`/home/mendel/Documents/Projects/drivers/libsigrok-arch/build-simplified`
+
+From `/home/mendel/Documents/Projects/drivers/libsigrok-arch`:
 
 ```sh
-autoreconf -fi
-mkdir -p build-performance
-cd build-performance
+mkdir -p build-simplified
+cd build-simplified
 PKG_CONFIG_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib/pkgconfig \
   ../configure --disable-all-drivers --enable-bkprecision-1697 --enable-demo \
   --disable-cxx --enable-static > configure.log 2>&1
 make -j4 > build.log 2>&1
 cd ..
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 120 \
+  sh tests/bk1697-driver.sh > build-simplified/driver-tests.log 2>&1
+LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+  make -C build-simplified check -j4 > build-simplified/check.log 2>&1
+git diff --check
 ```
 
-The script still defaults to `build-hardware`; use the explicit override:
+The hook still defaults to `build-hardware`; always supply the override here.
+It compiles with `-std=c99 -Wall -Wextra -Werror`, uses the selected build's real
+static archive, and obtains dependency libraries from system pkg-config without
+linking system libsigrok. Local Check needs the runtime directory above.
+Existing upstream Check assertion-format warnings are outside this change.
+
+Six serial I/O/open/close/flush functions are simulated. Legacy
+`serial_source_add/remove` wrappers now reject calls rather than hiding serial
+readiness behind a fake timer. The two keyed session-source wrappers verify the
+actual driver registration (key=device, fd=-1, events=0, timeout=10) and forward
+unchanged to the real session implementation. Dispatch verifies no readiness
+events. Source removal uses the same device key. No parser or driver source is
+compiled directly into the integration executable.
+
+## Test-first evidence
+
+Each new behavioral regression was run against the preceding implementation
+before its fix. Focused command (substitute the test name below):
 
 ```sh
-BK1697_BUILD_DIR="$PWD/build-performance" timeout 30 \
-  sh tests/bk1697-driver.sh -p /bk1697/snapshot-latency
-BK1697_BUILD_DIR="$PWD/build-performance" timeout 210 \
-  sh tests/bk1697-driver.sh > build-performance/driver-tests.log 2>&1
-LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-  make -C build-performance check -j4 > build-performance/check.log 2>&1
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/open-without-delay
 ```
 
-The hook compiles with `cc -std=c99 -Wall -Wextra -Werror`, source/build include
-directories, `--whole-archive` of the selected build's static library, the eight
-wrap flags, system `pkg-config --static --libs libsigrok` dependencies
-**excluding `-lsigrok`**, and `-lm`. It includes libtirpc when available. It never
-links the system libsigrok implementation. Its temporary executable is removed
-on exit. The build directory must correspond to this source tree.
+| Regression | RED | GREEN (focused run) |
+| --- | --- | --- |
+| `open-without-delay` | 2000.098 ms; failed <80 ms bound | 0.006 ms; flush and exactly four read-only probes |
+| `held-wire-limits` | 300.125 ms; failed <50 ms bound | 0.039 ms, zero extra commands |
+| `timer-source` | legacy serial source count 1, expected 0 | real timer: 10 callbacks over 100 ms, companion timer 10, balanced removal |
+| `callback-setter-fault/ack` | source removals 0, expected 1 | ACK and readback fault cases both pass; deferred END ordering preserved |
 
-An initial `make check` without `LD_LIBRARY_PATH` passed the parser executable
-but could not load `libcheck.so.0` for `tests/main` (exit 127). Supplying the local
-runtime directory fixed that environment failure; no package/source fix was
-needed. Existing upstream Check deprecated-assertion format warnings are not
-introduced by this refactor.
+All RED runs exited 134 from assertions, not watchdog expiry. Logs are
+`build-simplified/{open,limits,timer,setter-fault}-{red,green}.log`.
+The held-wire test uses the existing bounded 300 ms condition-variable watchdog,
+so a blocked local setter cannot hang the RED run indefinitely. Open latency is
+measured on instantaneous fake serial I/O; it asserts no artificial delay, not
+a manufacturer timing guarantee or minimum quiet period.
 
-## Historical cache-refactor red / green timing (before spacing removal)
+## Scoped setting waits and GPAL OVP: test-first evidence
 
-The **first change was the public-API latency regression**, before driver edits.
-The source was autoreconf'd/configured/built as above with unchanged driver code.
-Running the single-test command above against that baseline archive produced:
+The parent's `bk1697/libsigrok/hardware-write-timing-stress.log` reports dropped
+GETS replies directly after VOLT ACK: 23/30 successes without a gap, 30/30 with
+1 ms, 30/30 with 3 ms, output OFF and 1.5/1.6 V settings. The initial VOLT-only wait was later extended to CURR after the parent observed
+a CURR-ACK-to-GETS restoration failure following a 300-frame exercise (output
+already OFF). `bk1697/libsigrok/hardware-current-timing-stress.log` reports
+26/30 successes at zero gap and 30/30 at 1 ms; `hardware-off-timing-stress.log`
+reports SOUT001->GPAL 30/30 at both zero and 1 ms. Only successful VOLT and CURR
+ACKs wait 1 ms before GETS. SOUT and read commands remain undelayed. This is
+observed firmware behavior, not a manufacturer specification. No global gap or
+open quarantine was restored.
 
-```text
-held-wire getters: 900.760 ms, 6 extra commands
-assertion failed (getter_elapsed < 50000): (900760 < 50000)
-exit 134
-```
+- Initial `voltage-readback-delay` (historical): RED measured a 0.000 ms VOLT-to-GETS minimum and
+  failed the >=1 ms bound. Focused GREEN measured a 1.055 ms minimum, with the
+  ten other gaps totaling 0.037 ms; all 12 actual commands took 2.187 ms. The
+  existing <80 ms no-global-spacing regression remains unchanged. The aggregate
+  non-VOLT bound (<5 ms for ten gaps) also rejects a blanket 1 ms gap without
+  requiring a fragile sub-millisecond bound on every scheduler interruption.
+- Current `setting-readback-delay` replaces the VOLT-only test without changing
+  the integration count. RED measured CURR->GETS 0.000 ms (VOLT 1.060 ms),
+  failing the CURR >=1 ms bound. GREEN measured VOLT 1.061 ms and CURR 1.054 ms;
+  the eight remaining gaps totaled 0.043 ms, and all 12 commands took 4.320 ms.
+  Exactly two VOLT and two CURR readbacks are checked; the remaining sequence
+  includes both SOUT000 and SOUT001. The <5 ms aggregate bound rejects blanket
+  1 ms spacing, and the original <80 ms no-global-spacing checks remain.
+  Logs: `build-simplified/setting-delay-{red,green}.log`.
+- Parser `panel-ovp`: RED failed the synthetic active assertion. GREEN validates
+  the actual literal inactive GPAL fixture, synthetic active state at index 64,
+  unchanged output bits, every partial boundary, and rejection of indicator `2`.
+- `ovp-getter`: RED returned SR_ERR_NA. GREEN verifies initial false from the
+  probe, true/false after GPAL expiry, shared response reuse with enabled, and
+  no inference that fault means output OFF or ON.
+- `ovp-poll/activate-clear`: RED reached zero of two expected metadata stages
+  within its bounded session. GREEN observes true then false through normal
+  GPAL rotation, verifies cached getters issue no UART commands in callbacks,
+  and checks regulation/sample accounting remains separate from OVP metadata.
+- `ovp-poll/callback-stop` and `callback-close`: verify the triggering metadata
+  reaches a later observer before END, balanced source removal, and no packets
+  after END. Held-reply snapshot tests now include OVP; fault-latching tests
+  require an error, not a fabricated OVP value, after communication failure.
 
-An acquisition GETD reply is held at the serial boundary while another thread
-reads voltage, current, regulation, target, limit, enabled, connection ID and
-sample limit. A condition-variable watchdog releases the held reply after at
-most 300 ms if getters have not completed, so RED cannot deadlock on the held
-reply. The external timeout also bounds setup/session failures. The failure
-includes the watchdog delay and the six paced synchronous getter commands.
+Evidence logs: `build-simplified/voltage-delay-{red,green}.log`,
+`ovp-parser-{red,green}.log`, `ovp-getter-{red,green}.log`, and
+`ovp-meta-{red,green}.log`. All new RED failures were assertions (exit 134).
+For the parser case, build `tests/check_bkprecision_1697` then run it with
+`-p /bk1697/panel-ovp`; integration cases use the existing shell hook and `-p`.
 
-After grouped snapshots and non-waiting acquisition scheduling, rebuilding and
-running the same regression first produced **0.076 ms, zero extra commands**.
-A subsequent full run produced **0.050 ms, zero extra commands**. The final
-regression additionally reads the advertised voltage range while wire is held
-and verifies the old actual target (12 V). Active-setter coverage holds a setter
-ACK instead of GETD and checks the same no-I/O/under-50-ms behavior. Historical
-full-run results before spacing removal (21/21 integration cases passed):
+## Final verification
 
-| Measurement | Original baseline | Cache refactor, still paced |
-| --- | ---: | ---: |
-| Held-GETD getter batch | 900.760 ms, 6 extra commands (RED) | 0.031 ms, 0 extra commands |
-| Getter batch during held setter ACK | Not separately measured | 0.089 ms, 0 extra commands |
-| Expired idle GETS pair | Not separately measured | 0.027 ms, 1 shared query |
-| Maximum live GETS / GPAL refresh gap | No periodic status refresh | 806.519 / 806.449 ms |
+Final rerun after scoped VOLT/CURR timing and cached/metadata OVP support:
 
-The idle number follows an explicit TTL-expiry wait and a ready pacing slot;
-it is not a physical serial round-trip estimate. That run of `make check` passed both
-executables: four GLib parser/setting cases and 76 upstream Check checks, zero
-failures/errors. `git diff --check` passed. Logs are in
-`build-performance/{driver-tests.log,check.log,tests/main.log}`. Measurements are
-backend-only on this machine; no SmuView GUI latency was measured.
+- **34/34 integration cases pass** (the preceding 29 plus five).
+- **5/5 parser/setting cases pass**.
+- **76/76 upstream Check checks pass**, zero failures/errors.
+- `git diff --check` passes.
 
-## Inter-command spacing removal: test-first red / green
+Earlier simplification cases are open-without-delay, held-wire-limits, timer-source,
+active-setter-fault, callback-setter-fault/ack, callback-setter-fault/readback,
+and late-probe-validation. The timer test runs a second timer with the same
+fd=-1 and a different key in the same real session; it requires multiple callbacks
+but no busy loop and exactly one driver add/remove. The callback fault cases
+verify immediate source removal, no nested END, triggering-packet delivery to a
+later observer before END, and no subsequent analog/frame-end/meta packets.
+The external setter-fault case requires END without waiting for another poll.
+Late-probe tests reject out-of-envelope GETD and semantically invalid GPAL after
+earlier probe groups succeeded, without serving partially seeded caches.
 
-There is no verified manufacturer requirement for the old 100 ms gap. The
-original conservative workaround for a missing reply is not such a source.
-Spacing has therefore been removed, without changing serialization, CR/OK
-framing, reply consumption, timeout/fault handling or mandatory actual readback.
+Existing coverage remains: grouped 250 ms idle TTL reuse/expiry; active getters
+under held wire and held setter ACK; mandatory actual GETS/GPAL readback, including
+ACKs which do not change actual settings and readback failure; 120 GETD polls
+produce exactly 120 samples while both status groups refresh at least twice;
+100 ms spacing is **not** required. The uncached 12-command no-delay regression
+continues to enforce total time and maximum reply-to-next-command gap <80 ms on
+the instantaneous model. Fault cases explicitly expire caches when transport
+injection requires it, and preserve timeout, short/failed write, malformed reply,
+CRLF, overlong frame, panel indicators, pending input and read-error checks.
 
-Before editing driver code, `no-command-spacing` was added and run against the
-existing paced `build-performance` archive. It performs two rounds of
-VOLT + GETS, CURR + GETS, SOUT + GPAL through the public config API. All 12
-commands are uncached. Both total elapsed time and the maximum measured gap from
-prior reply completion to next write must be under 80 ms on the instantaneous
-serial model. The existing minimum-100-ms assertion was replaced by scoped gap
-measurement; all complete-reply and concurrency assertions were retained.
+Explicit close/reopen flushes staged stale bytes and executes GMAX/GETS/GETD/GPAL
+only. No timed quarantine or automatic retry/replay of ambiguous writes is
+required. Programming bounds/headroom, smaller GMAX, both GETD formats,
+precision/units/regulation, time/sample limits, wire exclusion under a held
+reply, re-entry, stop/close from callbacks, repeated stop from END and explicit
+restart remain covered. Complete prior reply consumption is checked at every
+write. No existing wire-completion or no-interleaving assertions were removed.
 
-```text
-RED:   12 uncached commands: 1200.969 ms total, 100.084 ms maximum reply-to-command gap
-       assertion failed (wire.max_command_gap < 80000): (100084 < 80000); exit 134
-GREEN: 12 uncached commands: 0.114 ms total, 0.078 ms maximum reply-to-command gap
-       PASS
-```
+## Design and scope
 
-Exact commands from this source directory (RED before driver edits; GREEN after
-removing spacing and rebuilding):
+The transport query handles framing and bounded I/O only. A narrow typed group
+table/helper selects GETD/GETS/GPAL, validates envelopes and publishes snapshots
+for idle misses, probe, acquisition and setter readback. No reverse command-name
+comparison is needed. `cache_ready` gates all groups after a complete successful
+probe; per-snapshot valid flags are redundant and removed. Boolean response
+fields use `gboolean`. Local limit setters use only the short cache mutex.
+GPAL index 64 supplies the active-low FAULT/OVP state, validated as binary,
+exposed through the read-only OVP-active capability and sent as boolean metadata
+on GPAL polls. Output bits remain independent. Packet reservations preserve END
+ordering for stop/close from an OVP metadata callback.
 
-```sh
-BK1697_BUILD_DIR="$PWD/build-performance" timeout 30 \
-  sh tests/bk1697-driver.sh -p /bk1697/no-command-spacing \
-  > build-performance/no-spacing-red.log 2>&1
-make -C build-performance -j4 > build-performance/build.log 2>&1
-BK1697_BUILD_DIR="$PWD/build-performance" timeout 30 \
-  sh tests/bk1697-driver.sh -p /bk1697/no-command-spacing \
-  > build-performance/no-spacing-green.log 2>&1
-BK1697_BUILD_DIR="$PWD/build-performance" timeout 210 \
-  sh tests/bk1697-driver.sh > build-performance/driver-tests-no-spacing.log 2>&1
-LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
-  make -C build-performance check -j4 > build-performance/check-no-spacing.log 2>&1
-```
+No worker framework, extra trailer check, maximum cache age, replacement quiet
+delay or parser cursor was added. The only new serial settling wait is 1 ms
+after successful VOLT or CURR ACK before mandatory GETS; no other commands inherit
+it. Intentional waits also include actual synchronous
+serial I/O (two-second overall deadline, up to 500 ms per read/write), wire-mutex
+contention for wire operations, and the real 10 ms timer tick. TTL/status ages
+remain 250/500 ms freshness rules, not serial-command sleeps. Test-only expiry
+waits, contention observation and watchdogs remain.
 
-Final full-run results: **22/22 integration cases passed**, four parser/setting
-cases passed, and all **76 upstream Check checks passed** (zero failures/errors).
-`git diff --check` passed. The final no-delay batch was **0.086 ms total**, with
-**0.051 ms maximum reply-to-command gap**; held-GETD getters took 0.042 ms and
-held-setter getters 0.045 ms, both with zero extra commands. Live GETS/GPAL maximum
-refresh gaps were 524.714/524.742 ms, with 120 GETD polls producing 120 samples.
-The focused GREEN timing above is retained separately from this full-run timing.
+Removing the quiet delay deliberately does not claim protection against bytes
+which arrive after the open flush; the device is expected to answer ordinary
+serialized commands sanely. Faults still latch until explicit reconnect, and no
+ambiguous write is retried. Active getters may retain previous actual snapshots
+during a setter; groups are not globally atomic. Slow serial I/O still blocks
+the session thread and may delay status freshness. Hardware behavior, loaded
+current/CC scaling, electrical accuracy and arbitrary thread schedules remain
+unverified by this offline work. Parent-reported GUI/performance measurements
+are attributed in the driver README; final physical OVP/UI testing is parent-owned. Two simultaneous physical devices are not emulated;
+per-device key registration and same-fd timer coexistence are tested directly.
 
-Readback-fault coverage was strengthened as a separate test-first correction:
-requiring two commands for the failed setter first exposed that the emulator's
-`fail_readback` was interrupting the write ACK (15 commands instead of expected
-16, exit 134). The injection now occurs on GETS after the ACK succeeds, and the
-assertion passes. All fault/no-ambiguous-retry and concurrency assertions remain.
-Focused evidence is in `build-performance/readback-seam-{red,green}.log`.
-
-Intentional driver waits remain separate: the existing two-second open
-quarantine before flushing; synchronous serial reads/writes with a two-second
-overall transaction deadline and at most 500 ms per read/write; and wire-mutex
-contention for setters/idle misses/lifecycle operations. The 10 ms source tick,
-250 ms idle TTL and 500 ms status refresh age are scheduling/freshness rules,
-not sleeps between serial commands. Tests additionally use real 260 ms cache-
-expiry waits, a 50 ms contention observation and bounded held-reply watchdogs.
-No hardware or SmuView UI timing was measured.
-
-## Checks
-
-There are **22 GLib integration cases** (the previous 21, plus no-command-spacing):
-
-- `no-command-spacing`: six repeated VOLT/CURR/SOUT setter calls produce exactly
-  12 actual commands in the expected setter/GETS-or-GPAL sequence. The instant
-  serial model must complete the command batch and each reply-to-next-command
-  gap in under 80 ms, excluding setup/quarantine. Replies must be fully consumed;
-  no clock or sleep helper is mocked.
-
-- `snapshot-latency`: cached acquisition getters and range-list reads finish
-  under 50 ms with no transport commands while a GETD reply owns the wire lock.
-- `active-setter-snapshot`: the same guarantee while a setter ACK is held;
-  readers retain previous actual values until successful actual readback.
-- `idle-groups`: probe-seeded reuse; expired GETS serves target/limit together,
-  GETD serves voltage/current/regulation together, and GPAL serves repeated
-  enabled reads with no duplicate commands; 260 ms real waits explicitly force
-  TTL misses and observe changed values; close/reopen re-seeds.
-- `actual-readback`: fake ACKs deliberately leave settings/output unchanged;
-  VOLT/CURR must issue GETS and SOUT must issue GPAL before returning. Getters
-  report actual old values, not requested ones. Readback failure invalidates all
-  cached state, latches the fault and requires explicit reconnect.
-- `live-status`: uncommanded settings/output changes become visible during live
-  polling without getter I/O. At least two refreshes of each status group occur,
-  with maximum gaps below 1.1 s (scheduler slack) on this responsive fake link;
-  exactly 120 GETD transactions produce exactly 120 samples, excluding GETS/GPAL.
-  The window was increased from 20 to 120 samples because faster acquisition
-  otherwise ends before the status refresh age; freshness assertions remain.
-- `settings`: explicit-connection-only scan; exactly GMAX/GETS/GETD/GPAL on
-  scan/open; no close writes; repeated public open/close rejection without
-  transport traffic; 7-/9-digit GETD scaling and CV/CC; GETS/GPAL actual readback;
-  SOUT active-low polarity, ACK-only and data-plus-ACK replies; minimum/maximum
-  VOLT/CURR; invalid/off-step/nonfinite settings rejected without wire traffic.
-  Format changes explicitly expire GETD so a valid cache cannot hide the test.
-- `faults-reconnect`: timeout, read error, short/failed write, malformed digits,
-  missing ACK, CRLF, overlong response, invalid GPAL indicators, pending input
-  and preflight failure. GPAL fault injection explicitly expires its cache.
-  Faulted reads/writes/open-without-close do no more I/O. Explicit close/reopen
-  quarantines and flushes a staged late ACK, then performs four read-only probes.
-  Closed getters cannot return prior cached device values.
-- `deadline`: explicitly expired GETD encounters slow arriving bytes beyond the
-  two-second overall deadline; fault latching and explicit recovery still apply.
-- `revalidation`: invalid GMAX and out-of-envelope GETS fail reopen/close the
-  transport; 40.2 V / 5.02 A headroom remains legal readback, never write targets.
-- `acquisition`: real session start/run/termination, both GETD formats, balanced
-  frames, numerical values/units/precision, regulation metadata, sample limits,
-  and configuration re-entry from analog callbacks outside the wire lock.
-- `time-limit`: stops before a measurement frame when the time limit is due.
-- `acquisition-fault`: timeout emits no sample, stops, invalidates the cached
-  snapshot and latches the fault, then recovers only after explicit reconnect.
-- `concurrent`: a held GETD reply excludes competing configuration transport
-  access; VOLT/CURR/SOUT and actual GETS/GPAL replies finish while acquisition is
-  active; samples retain correct values and no response bytes are left queued.
-- `smaller-maximum`: advertised ranges and programming bounds honor GMAX.
-- Five `callback-stop/*` cases stop from HEADER, FRAME_BEGIN, ANALOG, FRAME_END,
-  and META; `callback-close/analog` closes from a callback; `close-active`
-  removes the source and ends acquisition even when public close already marked
-  the device inactive. A later observer sees the triggering packet before END,
-  no packets arrive after END, repeated stop from END is idempotent, and explicit
-  reopen/start does not inherit acquisition or samples from the old generation.
-
-Every write checks complete prior reply consumption, preserving the existing
-no-interleaving and held-reply assertions. No minimum command gap is required.
-Every flush checks the unchanged two-second open quarantine.
-No clocks/sleeps are mocked. Allow roughly three minutes, with a 210-second
-external watchdog for the full suite.
-
-## Automatic integration (parent-owned)
-
-Keep this an optional separate executable/hook, not part of `tests/main.c`.
-Enable only with the native driver, static archive, serial support and GNU-ld
-wrapping. The parent may register the hook with `BK1697_BUILD_DIR` set to its
-build, or translate it into a conditional Automake target using configured
-dependency flags. Do not enable linker wrap flags globally or require them on
-other platforms. The existing pure-parser test remains independent. Master
-porting and package integration are outside this change.
-
-## Scope / risks
-
-The driver uses no background worker. Active getters never acquire the wire
-mutex. Idle misses, setters and lifecycle operations remain synchronous. The
-acquisition callback trylocks wire and defers when busy; there is no pacing
-state or delay. The 10 ms source tick is polling cadence, not inter-command
-spacing. Physical reply I/O still blocks the session thread
-up to the bounded deadline. Busy setters or slow hardware can delay refresh
-beyond the nominal 0.5–1 s target. Groups are coherent individually, not a global
-cross-group snapshot. During a setter, active readers may see the previous
-acknowledged actual value; faults and close invalidate every group.
-
-This tests the serial API, not libserialport, UART/USB framing, physical timing,
-electrical behavior, or the SmuView UI. Nonzero 9-digit current scaling remains
-unverified under load. Transport open/flush/close/source-registration failures,
-disabled channels and arbitrary cross-thread lifecycle schedules are not
-exhaustive. No hardware or package edits were made and no commits were created.
+Package integration and master porting remain parent-owned. No hardware,
+agents, package edits or commits were used.
