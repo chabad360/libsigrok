@@ -37,13 +37,16 @@ static struct sr_context *ctx;
 static struct sr_dev_driver *driver;
 static struct sr_dev_inst *device;
 static struct sr_session *session;
-static gboolean reentrant;
+static gboolean reentrant, stream_ended, close_packet, repeat_stop;
+static gboolean observer_ended;
+static unsigned int observer_ends;
+static int stop_packet;
 
 int __wrap_serial_open(struct sr_serial_dev_inst *serial, int flags)
 {
 	(void)serial;
 	(void)flags;
-	g_assert_false(wire.opened);
+	g_assert(!(wire.opened));
 	wire.opened = TRUE;
 	wire.opens++;
 	wire.opened_at = g_get_monotonic_time();
@@ -53,7 +56,7 @@ int __wrap_serial_open(struct sr_serial_dev_inst *serial, int flags)
 int __wrap_serial_close(struct sr_serial_dev_inst *serial)
 {
 	(void)serial;
-	g_assert_true(wire.opened);
+	g_assert(wire.opened);
 	wire.opened = FALSE;
 	wire.closes++;
 	return SR_OK;
@@ -62,7 +65,7 @@ int __wrap_serial_close(struct sr_serial_dev_inst *serial)
 int __wrap_serial_flush(struct sr_serial_dev_inst *serial)
 {
 	(void)serial;
-	g_assert_true(wire.opened);
+	g_assert(wire.opened);
 	/* Reconnect must quarantine delayed responses before flushing them. */
 	g_assert_cmpint(g_get_monotonic_time() - wire.opened_at, >=, 2000000);
 	g_string_truncate(wire.rx, 0);
@@ -98,7 +101,7 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 {
 	char *command, panel[73];
 	(void)serial;
-	g_assert_true(wire.opened);
+	g_assert(wire.opened);
 	g_assert_cmpuint(timeout_ms, <=, 500);
 	g_assert_cmpuint(count, >, 1);
 	g_assert_cmpint(((const char *)buf)[count - 1], ==, '\r');
@@ -229,14 +232,14 @@ static GVariant *get(uint32_t key)
 {
 	GVariant *value = NULL;
 	g_assert_cmpint(sr_config_get(driver, device, NULL, key, &value), ==, SR_OK);
-	g_assert_nonnull(value);
+	g_assert((value) != NULL);
 	return value;
 }
 
 static void check_double(uint32_t key, double expected)
 {
 	GVariant *value = get(key);
-	g_assert_true(fabs(g_variant_get_double(value) - expected) < 0.00001);
+	g_assert(fabs(g_variant_get_double(value) - expected) < 0.00001);
 	g_variant_unref(value);
 }
 
@@ -279,10 +282,10 @@ static void setup(void)
 	for (i = 0; drivers[i]; i++)
 		if (!strcmp(drivers[i]->name, "bkprecision-1697"))
 			driver = drivers[i];
-	g_assert_nonnull(driver);
+	g_assert((driver) != NULL);
 	g_assert_cmpint(sr_driver_init(ctx, driver), ==, SR_OK);
-	g_assert_null(sr_driver_scan(driver, NULL));
-	g_assert_null(scan(""));
+	g_assert((sr_driver_scan(driver, NULL)) == NULL);
+	g_assert((scan("")) == NULL);
 	g_assert_cmpuint(wire.opens, ==, 0);
 	devices = scan("/offline/bk1697-no-hardware");
 	g_assert_cmpuint(g_slist_length(devices), ==, 1);
@@ -291,7 +294,7 @@ static void setup(void)
 	g_assert_cmpuint(wire.commands->len, ==, 4);
 	probe_at(0);
 	g_assert_cmpuint(wire.closes, ==, 1);
-	g_assert_false(wire.opened);
+	g_assert(!(wire.opened));
 	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
 	g_assert_cmpuint(wire.commands->len, ==, 8);
 	probe_at(4);
@@ -299,6 +302,12 @@ static void setup(void)
 	g_assert_cmpuint(wire.commands->len, ==, 8);
 	session = NULL;
 	reentrant = FALSE;
+	stream_ended = FALSE;
+	close_packet = FALSE;
+	repeat_stop = FALSE;
+	observer_ended = FALSE;
+	observer_ends = 0;
+	stop_packet = -1;
 }
 
 static void teardown(void)
@@ -344,11 +353,11 @@ static void test_settings(void)
 		wire.output_data = i;
 		g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), ==, SR_OK);
 		value = get(SR_CONF_ENABLED);
-		g_assert_true(g_variant_get_boolean(value));
+		g_assert(g_variant_get_boolean(value));
 		g_variant_unref(value);
 		g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(FALSE)), ==, SR_OK);
 		value = get(SR_CONF_ENABLED);
-		g_assert_false(g_variant_get_boolean(value));
+		g_assert(!(g_variant_get_boolean(value)));
 		g_variant_unref(value);
 	}
 	count = wire.commands->len;
@@ -387,7 +396,7 @@ static void assert_latched(void)
 	g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(FALSE)), !=, SR_OK);
 	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), !=, SR_OK);
 	g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_CURRENT, &value), !=, SR_OK);
-	g_assert_null(value);
+	g_assert((value) == NULL);
 	g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
 	g_assert_cmpuint(wire.commands->len, ==, count);
 	g_assert_cmpuint(wire.prereads, ==, prereads);
@@ -409,7 +418,7 @@ static void test_faults(void)
 		if (faults[i] == BAD_PANEL) {
 			value = NULL;
 			g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_ENABLED, &value), !=, SR_OK);
-			g_assert_null(value);
+			g_assert((value) == NULL);
 		} else
 			g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), !=, SR_OK);
 		g_assert_cmpuint(wire.commands->len, ==,
@@ -430,7 +439,7 @@ static void test_deadline(void)
 	start = g_get_monotonic_time();
 	g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_VOLTAGE, &value), !=, SR_OK);
 	elapsed = g_get_monotonic_time() - start;
-	g_assert_null(value);
+	g_assert((value) == NULL);
 	g_assert_cmpint(elapsed, >=, 2000000);
 	/* Include one pacing interval and scheduler slack, not another reply. */
 	g_assert_cmpint(elapsed, <, 3000000);
@@ -449,14 +458,14 @@ static void test_revalidation(void)
 	memcpy(wire.maximum, "403502", 7);
 	count = wire.commands->len;
 	g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
-	g_assert_false(wire.opened);
+	g_assert(!(wire.opened));
 	g_assert_cmpuint(wire.commands->len, ==, count + 1);
 	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GMAX00");
 	memcpy(wire.maximum, "402502", 7);
 	wire.voltage_count = 403;
 	count = wire.commands->len;
 	g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
-	g_assert_false(wire.opened);
+	g_assert(!(wire.opened));
 	g_assert_cmpuint(wire.commands->len, ==, count + 2);
 	wire.voltage_count = 402;
 	wire.current_count = 502;
@@ -483,9 +492,19 @@ static void feed(const struct sr_dev_inst *sdi,
 	float sample;
 	(void)sdi;
 	(void)data;
+	if (packet->type == SR_DF_HEADER)
+		stream_ended = FALSE;
+	else
+		g_assert(!stream_ended);
 	switch (packet->type) {
 	case SR_DF_HEADER: wire.headers++; break;
-	case SR_DF_END: wire.ends++; break;
+	case SR_DF_END:
+		wire.ends++;
+		stream_ended = TRUE;
+		/* A stop from END must be idempotent, not recursively emit END. */
+		if (repeat_stop)
+			g_assert_cmpint(sr_session_stop(session), ==, SR_OK);
+		break;
 	case SR_DF_FRAME_BEGIN: wire.frames++; break;
 	case SR_DF_FRAME_END: wire.frame_ends++; break;
 	case SR_DF_META:
@@ -526,6 +545,15 @@ static void feed(const struct sr_dev_inst *sdi,
 		break;
 	default: g_error("Unexpected packet type %d", packet->type);
 	}
+	if (packet->type == stop_packet) {
+		unsigned int count = wire.commands->len;
+		stop_packet = -1;
+		if (close_packet)
+			g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+		else
+			g_assert_cmpint(sr_session_stop(session), ==, SR_OK);
+		g_assert_cmpuint(wire.commands->len, ==, count);
+	}
 }
 
 static void new_session(uint64_t samples, uint64_t msec)
@@ -538,6 +566,84 @@ static void new_session(uint64_t samples, uint64_t msec)
 	g_assert_cmpint(sr_session_new(ctx, &session), ==, SR_OK);
 	g_assert_cmpint(sr_session_dev_add(session, device), ==, SR_OK);
 	g_assert_cmpint(sr_session_datafeed_callback_add(session, feed, NULL), ==, SR_OK);
+}
+
+static void observe_order(const struct sr_dev_inst *sdi,
+	const struct sr_datafeed_packet *packet, void *data)
+{
+	(void)sdi;
+	(void)data;
+	if (packet->type == SR_DF_HEADER)
+		observer_ended = FALSE;
+	else
+		g_assert(!observer_ended);
+	if (packet->type == SR_DF_END) {
+		observer_ended = TRUE;
+		observer_ends++;
+	}
+}
+
+static void test_callback_stop(gconstpointer data)
+{
+	int kind = GPOINTER_TO_INT(data);
+	unsigned int count;
+	setup();
+	new_session(0, 0);
+	close_packet = (kind & 0x10000) != 0;
+	repeat_stop = TRUE;
+	/* The first callback stops; this later callback must still see the
+	 * triggering packet before END, not receive it after a nested END. */
+	g_assert_cmpint(sr_session_datafeed_callback_add(session, observe_order, NULL), ==, SR_OK);
+	stop_packet = kind & 0xffff;
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpint(stop_packet, ==, -1);
+	g_assert_cmpuint(observer_ends, ==, 1);
+	g_assert_cmpuint(wire.headers, ==, 1);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpuint(wire.adds, ==, 1);
+	g_assert_cmpuint(wire.removes, ==, 1);
+	g_assert_cmpuint(wire.frames, ==, kind == SR_DF_HEADER ? 0 : 1);
+	if ((kind & 0xffff) == SR_DF_ANALOG)
+		g_assert_cmpuint(wire.analogs, ==, 1);
+	count = wire.commands->len;
+	if (close_packet) {
+		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+		probe_at(count);
+		g_assert_cmpuint(wire.commands->len, ==, count + 4);
+	}
+	teardown();
+}
+
+static void test_close_active(void)
+{
+	unsigned int count;
+	setup();
+	new_session(0, 0);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	count = wire.commands->len;
+	g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+	/* Fail directly rather than leave the unfixed session hung in run(). */
+	g_assert_cmpuint(wire.removes, ==, 1);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+	probe_at(count);
+	count = wire.commands->len;
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	g_assert_cmpuint(wire.frames, ==, 0);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpint(sr_session_destroy(session), ==, SR_OK);
+	session = NULL;
+	/* Reopening alone must not resurrect acquisition; explicit start works. */
+	new_session(1, 0);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.frames, ==, 1);
+	g_assert_cmpuint(wire.ends, ==, 2);
+	g_assert_cmpuint(wire.adds, ==, wire.removes);
+	teardown();
 }
 
 static void test_acquisition(void)
@@ -560,8 +666,8 @@ static void test_acquisition(void)
 		g_assert_cmpuint(wire.frame_ends, ==, wire.frames);
 		g_assert_cmpuint(wire.analogs, ==, (i + 1) * 4);
 		g_assert_cmpuint(wire.metas, ==, wire.frames);
-		g_assert_true(fabs(wire.voltage - (i ? 12.34 : 12.3)) < 0.00001);
-		g_assert_true(fabs(wire.current - (i ? 0.567 : 0.56)) < 0.00001);
+		g_assert(fabs(wire.voltage - (i ? 12.34 : 12.3)) < 0.00001);
+		g_assert(fabs(wire.current - (i ? 0.567 : 0.56)) < 0.00001);
 		g_assert_cmpint(sr_session_destroy(session), ==, SR_OK);
 		session = NULL;
 	}
@@ -618,7 +724,7 @@ static gpointer configure_thread(gpointer unused)
 	check_double(SR_CONF_VOLTAGE_TARGET, 13.2);
 	check_double(SR_CONF_CURRENT_LIMIT, 0.67);
 	value = get(SR_CONF_ENABLED);
-	g_assert_true(g_variant_get_boolean(value));
+	g_assert(g_variant_get_boolean(value));
 	g_variant_unref(value);
 	g_mutex_lock(&wire.lock);
 	wire.configured = TRUE;
@@ -664,8 +770,8 @@ static void test_concurrent(void)
 	g_thread_join(releaser);
 	g_assert_cmpuint(wire.frames, ==, 3);
 	g_assert_cmpuint(wire.analogs, ==, 6);
-	g_assert_true(fabs(wire.voltage - 12.34) < 0.00001);
-	g_assert_true(fabs(wire.current - 0.567) < 0.00001);
+	g_assert(fabs(wire.voltage - 12.34) < 0.00001);
+	g_assert(fabs(wire.current - 0.567) < 0.00001);
 	g_assert_cmpuint(wire.rx->len, ==, 0);
 	g_assert_cmpuint(wire.ends, ==, 1);
 	teardown();
@@ -684,14 +790,14 @@ static void test_smaller_maximum(void)
 	g_variant_get_child(value, 0, "d", &low);
 	g_variant_get_child(value, 1, "d", &high);
 	g_variant_get_child(value, 2, "d", &step);
-	g_assert_true(low == 1 && high == 20 && step == 0.1);
+	g_assert(low == 1 && high == 20 && step == 0.1);
 	g_variant_unref(value);
 	g_assert_cmpint(sr_config_list(driver, device, NULL, SR_CONF_CURRENT_LIMIT, &value), ==, SR_OK);
 	g_assert_cmpuint(g_variant_n_children(value), ==, 3);
 	g_variant_get_child(value, 0, "d", &low);
 	g_variant_get_child(value, 1, "d", &high);
 	g_variant_get_child(value, 2, "d", &step);
-	g_assert_true(low == 0.01 && high == 2 && step == 0.01);
+	g_assert(low == 0.01 && high == 2 && step == 0.01);
 	g_variant_unref(value);
 	count = wire.commands->len;
 	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(20.1)), ==, SR_ERR_ARG);
@@ -710,6 +816,13 @@ int main(int argc, char **argv)
 	g_test_add_func("/bk1697/faults-reconnect", test_faults);
 	g_test_add_func("/bk1697/deadline", test_deadline);
 	g_test_add_func("/bk1697/revalidation", test_revalidation);
+	g_test_add_data_func("/bk1697/callback-stop/header", GINT_TO_POINTER(SR_DF_HEADER), test_callback_stop);
+	g_test_add_data_func("/bk1697/callback-stop/frame-begin", GINT_TO_POINTER(SR_DF_FRAME_BEGIN), test_callback_stop);
+	g_test_add_data_func("/bk1697/callback-stop/analog", GINT_TO_POINTER(SR_DF_ANALOG), test_callback_stop);
+	g_test_add_data_func("/bk1697/callback-stop/frame-end", GINT_TO_POINTER(SR_DF_FRAME_END), test_callback_stop);
+	g_test_add_data_func("/bk1697/callback-stop/meta", GINT_TO_POINTER(SR_DF_META), test_callback_stop);
+	g_test_add_data_func("/bk1697/callback-close/analog", GINT_TO_POINTER(SR_DF_ANALOG | 0x10000), test_callback_stop);
+	g_test_add_func("/bk1697/close-active", test_close_active);
 	g_test_add_func("/bk1697/acquisition", test_acquisition);
 	g_test_add_func("/bk1697/time-limit", test_time_limit);
 	g_test_add_func("/bk1697/acquisition-fault", test_acquisition_fault);

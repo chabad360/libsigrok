@@ -30,7 +30,7 @@ static void captured_firmware(void)
 	struct bk1697_response r;
 
 	r = complete("402502\rOK\r", BK1697_VALUES);
-	g_assert_true(bk1697_valid_maximum(&r));
+	g_assert(bk1697_valid_maximum(&r));
 	g_assert_cmpfloat(r.voltage, ==, 40.2);
 	g_assert_cmpfloat(r.current, ==, 5.02);
 	r = complete("010502\rOK\r", BK1697_VALUES);
@@ -117,27 +117,27 @@ static void safe_settings(void)
 	size_t i;
 
 	for (i = 0; i < G_N_ELEMENTS(bad_voltage); i++)
-		g_assert_false(bk1697_setting(bad_voltage[i], 1, 40, 10, &counts));
+		g_assert(!(bk1697_setting(bad_voltage[i], 1, 40, 10, &counts)));
 	for (i = 0; i < G_N_ELEMENTS(bad_current); i++)
-		g_assert_false(bk1697_setting(bad_current[i], 0.01, 5, 100, &counts));
-	g_assert_true(bk1697_setting(40, 1, 40, 10, &counts));
+		g_assert(!(bk1697_setting(bad_current[i], 0.01, 5, 100, &counts)));
+	g_assert(bk1697_setting(40, 1, 40, 10, &counts));
 	g_assert_cmpuint(counts, ==, 400);
-	g_assert_true(bk1697_setting(5, 0.01, 5, 100, &counts));
+	g_assert(bk1697_setting(5, 0.01, 5, 100, &counts));
 	g_assert_cmpuint(counts, ==, 500);
-	g_assert_true(bk1697_setting((double)12.3f, 1, 40, 10, &counts));
+	g_assert(bk1697_setting((double)12.3f, 1, 40, 10, &counts));
 	g_assert_cmpuint(counts, ==, 123);
-	g_assert_true(bk1697_setting((double)0.01f, 0.01, 5, 100, &counts));
+	g_assert(bk1697_setting((double)0.01f, 0.01, 5, 100, &counts));
 	g_assert_cmpuint(counts, ==, 1);
 	r = complete("100100\rOK\r", BK1697_VALUES);
-	g_assert_true(bk1697_valid_maximum(&r));
-	g_assert_false(bk1697_setting(12.3, 1, r.voltage, 10, &counts));
-	g_assert_false(bk1697_setting(1.01, 0.01, r.current, 100, &counts));
+	g_assert(bk1697_valid_maximum(&r));
+	g_assert(!(bk1697_setting(12.3, 1, r.voltage, 10, &counts)));
+	g_assert(!(bk1697_setting(1.01, 0.01, r.current, 100, &counts)));
 	r = complete("600500\rOK\r", BK1697_VALUES);
-	g_assert_false(bk1697_valid_maximum(&r));
+	g_assert(!(bk1697_valid_maximum(&r)));
 	r = complete("400999\rOK\r", BK1697_VALUES);
-	g_assert_false(bk1697_valid_maximum(&r));
+	g_assert(!(bk1697_valid_maximum(&r)));
 	r = complete("000000\rOK\r", BK1697_VALUES);
-	g_assert_false(bk1697_valid_maximum(&r));
+	g_assert(!(bk1697_valid_maximum(&r)));
 }
 
 int main(int argc, char **argv)

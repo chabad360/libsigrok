@@ -81,15 +81,21 @@ static int dev_open(struct sr_dev_inst *sdi)
 static int dev_close(struct sr_dev_inst *sdi)
 {
 	struct dev_context *devc;
-	int ret;
+	int ret, close_ret;
+	gboolean end;
 
 	devc = sdi->priv;
 	g_mutex_lock(&devc->mutex);
-	ret = devc->opened ? serial_close(sdi->conn) : SR_OK;
+	/* sr_dev_close() has already made sdi inactive, so the public
+	 * acquisition-stop dispatcher cannot do this cleanup for us. */
+	ret = bk1697_stop_locked(sdi, &end);
+	close_ret = devc->opened ? serial_close(sdi->conn) : SR_OK;
 	devc->opened = FALSE;
 	/* In particular, no SOUT, remote/local or key-lock commands here. */
 	g_mutex_unlock(&devc->mutex);
-	return ret;
+	if (end)
+		bk1697_send_end(sdi);
+	return ret == SR_OK ? close_ret : ret;
 }
 
 static GSList *scan(struct sr_dev_driver *di, GSList *options)
@@ -271,17 +277,25 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 
 	devc = sdi->priv;
 	g_mutex_lock(&devc->mutex);
-	if (!devc->opened || devc->faulted) {
+	if (!devc->opened || devc->faulted || devc->active || devc->stopping) {
 		g_mutex_unlock(&devc->mutex);
 		return SR_ERR;
 	}
 	ret = serial_source_add(sdi->session, sdi->conn, G_IO_IN, 100,
 		bk1697_receive_data, (void *)sdi);
-	if (ret == SR_OK)
+	if (ret == SR_OK) {
+		devc->active = TRUE;
+		devc->generation++;
+		/* Reserve HEADER before releasing the mutex: close/stop can then
+		 * defer END until HEADER has reached every session callback. */
+		devc->sending = TRUE;
 		sr_sw_limits_acquisition_start(&devc->limits);
+	}
 	g_mutex_unlock(&devc->mutex);
-	if (ret == SR_OK)
+	if (ret == SR_OK) {
 		std_session_send_df_header(sdi);
+		bk1697_send_done(sdi);
+	}
 	return ret;
 }
 
@@ -300,7 +314,7 @@ static struct sr_dev_driver bkprecision_1697_driver_info = {
 	.dev_open = dev_open,
 	.dev_close = dev_close,
 	.dev_acquisition_start = dev_acquisition_start,
-	.dev_acquisition_stop = std_serial_dev_acquisition_stop,
+	.dev_acquisition_stop = bk1697_acquisition_stop,
 	.context = NULL,
 };
 SR_REGISTER_DEV_DRIVER(bkprecision_1697_driver_info);

@@ -881,6 +881,7 @@ tests_check_bkprecision_1697_SOURCES = \
 	tests/check_bkprecision_1697.c \
 	src/hardware/bkprecision-1697/parse.c \
 	src/hardware/bkprecision-1697/parse.h
+tests_check_bkprecision_1697_CFLAGS = $(AM_CFLAGS)
 tests_check_bkprecision_1697_LDADD = $(SR_EXTRA_LIBS)
 EXTRA_DIST += tests/bk1697_driver.c tests/bk1697-driver.sh tests/bk1697-driver.md \
 	src/hardware/bkprecision-1697/README.md
