@@ -809,7 +809,7 @@ python-build: $(PDIR)/timestamp
 
 $(PDIR)/timestamp: $(PDIR)/sigrok/core/classes.i \
 		bindings/swig/classes.i bindings/swig/templates.i \
-		bindings/swig/enums.i $(PDOC_START) $(PDOC_END) \
+		$(PDOC_START) $(PDOC_END) \
 		$(library_include_HEADERS) \
 		$(nodist_library_include_HEADERS) \
 		$(bindings_cxx_libsigrokcxx_la_include_HEADERS) \
@@ -851,8 +851,7 @@ $(RDOC): $(srcdir)/bindings/swig/doc.py $(CPPXMLDOC)
 	$(AM_V_GEN)$(PYTHON) $(srcdir)/bindings/swig/doc.py ruby $(CPPXMLDOC) > $@
 
 $(RWRAP): $(srcdir)/$(RDIR)/classes.i $(RDOC) \
-		bindings/swig/classes.i bindings/swig/templates.i \
-		bindings/swig/enums.i
+		bindings/swig/classes.i bindings/swig/templates.i
 	$(AM_V_GEN)$(SWIG) -ruby -c++ -Ibindings -Ibindings/cxx/include -I$(RDIR) $(local_includes) $(swig_defs) -o $@ $(srcdir)/$(RDIR)/classes.i
 
 $(ROBJ): $(RWRAP) \
@@ -910,7 +909,7 @@ $(JDOC): $(srcdir)/bindings/swig/doc.py $(CPPXMLDOC)
 	$(AM_V_GEN)$(PYTHON) $(srcdir)/bindings/swig/doc.py java $(CPPXMLDOC) > $@
 
 $(JCXX): $(srcdir)/$(JSWG) $(JDOC) bindings/swig/classes.i \
-		bindings/swig/templates.i bindings/swig/enums.i \
+		bindings/swig/templates.i \
 		$(bindings_cxx_libsigrokcxx_la_include_HEADERS) \
 		$(nodist_bindings_cxx_libsigrokcxx_la_include_HEADERS)
 	-$(AM_V_at)rm -f $(java_cleanfiles)

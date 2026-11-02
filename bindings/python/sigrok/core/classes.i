@@ -84,7 +84,9 @@ typedef guint pyg_flags_type;
      */
     if (!GLib) {
         fprintf(stderr, "Import of gi.repository.GLib failed.\n");
-#if PY_VERSION_HEX >= 0x03000000
+#if PY_VERSION_HEX >= 0x030e0000
+        return -1;
+#elif PY_VERSION_HEX >= 0x03000000
         return nullptr;
 #else
         return;
