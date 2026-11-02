@@ -26,28 +26,63 @@ output.
   six-digit-data-plus-ACK reply variants are consumed completely.
 - CR framing, no CRLF. Replies are bounded to 72 bytes and a two-second
   transaction deadline, with up to 500 ms per byte read/write. Commands are
-  mutex-serialized and paced at least 100 ms after the prior reply completes.
+  mutex-serialized through the complete reply, with no inserted inter-command
+  delay. No verified manufacturer requirement supports the former 100 ms gap.
 - Framing/I/O failure latches a fault. There is no automatic retry, including
   ambiguous writes or OFF. Inspect physical output if communication fails.
   Explicit close/open waits two seconds, flushes stale buffers, and re-probes;
   it never repeats a failed setting. Query state before deciding further action.
 
-## Physical verification and unresolved voltage discrepancy
+## Backend responsiveness and freshness
 
-The driver was exercised on an unloaded 1697: discovery, settings/readback,
-output switching, acquisition, invalid-setting rejection, and live voltage
-changes during acquisition worked. However, a 2.5 V target produced reported
-measurements around 3.2–3.4 V. Direct serial tests outside libsigrok reproduced
-this, and separately encoded GPAL measured-voltage fields agreed approximately.
-It persisted after settling and at 20 mA and 1 A current limits. Setpoint replies
-continued to report 2.5 V. No compensating conversion has been applied.
+Complete validated GETD (V/I/regulation), GETS (target/limit) and GPAL
+(output-state) responses are cached as separate groups. The existing read-only
+open probe seeds all three; it adds no discovery commands. Acquisition getters
+return the last validated group under a separate short mutex, even while a
+serial reply or setter holds the wire mutex. Connection ID is immutable; limit
+and range reads also avoid the wire mutex. There is no worker thread/framework.
 
-**The cause remains unresolved.** Software decoding/firmware interpretation,
-actual terminal voltage, calibration, and instrument behavior have not been
-independently distinguished. Front-panel inspection and an external meter are
-still required. Successful ACKs/readback do not establish electrical accuracy.
-The instrument was restored to 1.0 V / 0.01 A, output OFF after the tests.
-No loaded current/CC behavior or SmuView GUI has been physically verified.
+Outside acquisition, groups are reused for 250 ms from reply completion; an
+expired group is actually queried, with a second cache check after taking the
+wire mutex. A write expires the affected group's idle freshness and performs
+mandatory GETS (VOLT/CURR) or GPAL (SOUT) readback before returning success.
+Acquisition readers may see the previous acknowledged actual snapshot while a
+setter completes, never a fabricated requested value. Any transaction fault or
+close invalidates all groups; reconnect publishes usable snapshots only after
+the complete probe succeeds. Each group is coherent, not an atomic snapshot
+across all groups or across separate frontend getter calls.
+
+A 10 ms source timer attempts the wire mutex without waiting and defers only
+when it is busy. This timer is a polling tick, not an inter-command delay; idle
+queries and mandatory setter readbacks can run back-to-back. GETD slots alternate
+with age-gated GETS/GPAL slots (500 ms minimum refresh age; approximately 0.5–1 s
+status refresh on a responsive, uncontended link). Only GETD counts as a sample.
+No inter-command pacing state or sleep remains. Physical I/O is still synchronous
+and bounded by the existing two-second transaction deadline: slow hardware can
+still block the session thread, setters still wait for serial access, and
+competing writes/slow replies can delay status refresh.
+Lock order is wire then cache, never cache then wire; the cache lock never
+covers serial I/O, sleeps or session callbacks.
+
+Offline held-wire getter latency fell from 900.760 ms / six extra commands to
+under 1 ms / zero extra commands (50 ms regression threshold); see the exact
+measurements and commands in `tests/bk1697-driver.md`. This is a backend serial-
+seam measurement, **not a SmuView UI measurement**. A subsequent no-delay
+regression over six setters plus their six actual readbacks fell from
+1200.969 ms to 0.114 ms on the instantaneous serial model. The two-second
+open quarantine remains separate and unchanged.
+
+## Historical voltage discrepancy
+
+Earlier unloaded-device reports recorded a 2.5 V target with measurements around
+3.2–3.4 V, reproduced outside libsigrok and approximately corroborated by GPAL.
+No compensating conversion was applied. The parent user's existing artifact
+`bk1697/libsigrok/post-restart-comparison.md` subsequently reports recovery after
+a power cycle: native and ngscopeclient results track 2.5/3/5 V within 0.01 V.
+That artifact is not changed by this refactor. The original fault's root cause
+is still unknown; loaded current/CC behavior remains untested. Successful ACKs
+and readback do not independently establish electrical accuracy. This refactor
+used no hardware and makes no new electrical or GUI verification claim.
 
 ## Offline verification
 

@@ -8,14 +8,67 @@
 #include <string.h>
 #include "protocol.h"
 
-#define COMMAND_INTERVAL_US 100000
 #define TRANSACTION_TIMEOUT_US 2000000
+#define CACHE_TTL_US 250000
+#define STATUS_REFRESH_US 500000
+
+static const char *group_commands[] = { "GETD00", "GETS00", "GPAL00" };
+static const enum bk1697_reply group_replies[] = {
+	BK1697_MEASUREMENT, BK1697_VALUES, BK1697_PANEL
+};
+
+/* Called under the wire mutex. Invalidate all groups as one short operation. */
+SR_PRIV void bk1697_invalidate(struct dev_context *devc)
+{
+	g_mutex_lock(&devc->cache_mutex);
+	memset(devc->cache, 0, sizeof(devc->cache));
+	devc->cache_ready = FALSE;
+	g_mutex_unlock(&devc->cache_mutex);
+}
+
+static int cached(struct dev_context *devc, enum bk1697_group group,
+	struct bk1697_response *response)
+{
+	int ret;
+
+	g_mutex_lock(&devc->cache_mutex);
+	ret = SR_ERR;
+	if (devc->cache_ready && devc->cache[group].valid &&
+		(devc->cache_active || g_get_monotonic_time() -
+		devc->cache[group].updated < CACHE_TTL_US)) {
+		*response = devc->cache[group].response;
+		ret = SR_OK;
+	} else if (devc->cache_ready && !devc->cache_active) {
+		ret = SR_ERR_NA; /* Idle miss: caller may acquire the wire lock. */
+	}
+	g_mutex_unlock(&devc->cache_mutex);
+	return ret;
+}
+
+SR_PRIV int bk1697_get(const struct sr_dev_inst *sdi, enum bk1697_group group,
+	struct bk1697_response *response)
+{
+	struct dev_context *devc = sdi->priv;
+	int ret;
+
+	ret = cached(devc, group, response);
+	if (ret != SR_ERR_NA)
+		return ret;
+	/* Never acquire wire while holding cache. Recheck after a competing query. */
+	g_mutex_lock(&devc->mutex);
+	ret = cached(devc, group, response);
+	if (ret == SR_ERR_NA)
+		ret = bk1697_query(sdi, group_commands[group], group_replies[group], response);
+	g_mutex_unlock(&devc->mutex);
+	return ret;
+}
 
 static int fault(struct dev_context *devc)
 {
 	/* No retry, including OFF: a delayed reply could acknowledge the wrong
 	 * command. Only an explicit close/open and read-only probe can recover. */
 	devc->faulted = TRUE;
+	bk1697_invalidate(devc);
 	sr_err("Serial transaction failed; close/reopen the device before continuing.");
 	return SR_ERR_DATA;
 }
@@ -27,17 +80,15 @@ SR_PRIV int bk1697_query(const struct sr_dev_inst *sdi, const char *command,
 	struct sr_serial_dev_inst *serial;
 	char frame[16], reply[BK1697_REPLY_MAX], byte;
 	int ret, timeout;
+	unsigned int group;
 	size_t len, frame_len;
-	int64_t delay, deadline, remaining;
+	int64_t deadline, remaining;
 
 	devc = sdi->priv;
 	serial = sdi->conn;
 	if (!devc->opened || devc->faulted)
 		return SR_ERR;
 
-	delay = devc->next_command - g_get_monotonic_time();
-	if (delay > 0)
-		g_usleep(delay);
 	/* Never silently flush an unexpected old response before a command. */
 	ret = serial_read_nonblocking(serial, &byte, 1);
 	if (ret != 0)
@@ -64,7 +115,32 @@ SR_PRIV int bk1697_query(const struct sr_dev_inst *sdi, const char *command,
 		if (ret < 0)
 			return fault(devc);
 		if (ret == 1) {
-			devc->next_command = g_get_monotonic_time() + COMMAND_INTERVAL_US;
+			/* An acknowledged write expires idle reuse; active readers may
+			 * retain the previous actual snapshot until mandatory readback.
+			 * Any failed transaction invalidates every group via fault(). */
+			if (kind == BK1697_ACK || kind == BK1697_OUTPUT) {
+				group = kind == BK1697_OUTPUT ? BK1697_GPAL : BK1697_GETS;
+				g_mutex_lock(&devc->cache_mutex);
+				devc->cache[group].updated = 0;
+				g_mutex_unlock(&devc->cache_mutex);
+			}
+			/* Publish only complete, validated actual replies, never ACKs. */
+			if (!strcmp(command, "GETS00") &&
+				(response->voltage < 1.0 || response->voltage > devc->maximum.voltage ||
+				 response->current < 0.01 || response->current > devc->maximum.current))
+				return fault(devc);
+			if (!strcmp(command, "GETD00") &&
+				(response->voltage > 40.2 || response->current > 5.02))
+				return fault(devc);
+			for (group = 0; group < BK1697_GROUPS; group++) {
+				if (strcmp(command, group_commands[group]))
+					continue;
+				g_mutex_lock(&devc->cache_mutex);
+				devc->cache[group].response = *response;
+				devc->cache[group].updated = g_get_monotonic_time();
+				devc->cache[group].valid = TRUE;
+				g_mutex_unlock(&devc->cache_mutex);
+			}
 			return SR_OK;
 		}
 	}
@@ -83,20 +159,23 @@ SR_PRIV int bk1697_probe(const struct sr_dev_inst *sdi)
 		return ret;
 	if (!bk1697_valid_maximum(&r))
 		return fault(devc);
+	g_mutex_lock(&devc->cache_mutex);
 	devc->maximum = r;
+	g_mutex_unlock(&devc->cache_mutex);
 	ret = bk1697_query(sdi, "GETS00", BK1697_VALUES, &r);
 	if (ret != SR_OK)
 		return ret;
-	/* Readback can legitimately include the 40.2 V / 5.02 A headroom. */
-	if (r.voltage < 1.0 || r.voltage > devc->maximum.voltage ||
-		r.current < 0.01 || r.current > devc->maximum.current)
-		return fault(devc);
+	/* Query validates the readback envelope before publishing snapshots. */
 	ret = bk1697_query(sdi, "GETD00", BK1697_MEASUREMENT, &r);
 	if (ret != SR_OK)
 		return ret;
-	if (r.voltage > 40.2 || r.current > 5.02)
-		return fault(devc);
-	return bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
+	ret = bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
+	if (ret == SR_OK) {
+		g_mutex_lock(&devc->cache_mutex);
+		devc->cache_ready = TRUE;
+		g_mutex_unlock(&devc->cache_mutex);
+	}
+	return ret;
 }
 
 /* Called with the wire mutex held. Claim END once, including close, which
@@ -109,6 +188,9 @@ SR_PRIV int bk1697_stop_locked(const struct sr_dev_inst *sdi, gboolean *end)
 	if (!devc->active)
 		return SR_OK;
 	devc->active = FALSE;
+	g_mutex_lock(&devc->cache_mutex);
+	devc->cache_active = FALSE;
+	g_mutex_unlock(&devc->cache_mutex);
 	devc->stopping = TRUE;
 	/* If a packet is currently in a user callback, defer END until it
 	 * unwinds. Otherwise another thread could deliver END before that
@@ -187,26 +269,42 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	gboolean stop, end;
 	uint64_t generation;
 	int ret;
+	enum bk1697_group group;
+	int64_t updated;
 
 	(void)fd;
 	(void)revents;
 	sdi = cb_data;
 	devc = sdi->priv;
-	g_mutex_lock(&devc->mutex);
+	if (!g_mutex_trylock(&devc->mutex))
+		return TRUE;
 	if (!devc->active) {
 		g_mutex_unlock(&devc->mutex);
 		return FALSE;
 	}
 	generation = devc->generation;
+	g_mutex_lock(&devc->cache_mutex);
 	stop = sr_sw_limits_check(&devc->limits);
-	ret = stop ? SR_ERR : bk1697_query(sdi, "GETD00", BK1697_MEASUREMENT, &r);
+	group = BK1697_GETD;
+	/* Measurement slots alternate with fair, age-gated status slots. */
+	if (devc->refresh_group == 1 || devc->refresh_group == 3) {
+		group = devc->refresh_group == 1 ? BK1697_GETS : BK1697_GPAL;
+		updated = devc->cache[group].updated;
+		if (g_get_monotonic_time() - updated < STATUS_REFRESH_US)
+			group = BK1697_GETD;
+	}
+	g_mutex_unlock(&devc->cache_mutex);
+	/* No inter-command delay: physical reads remain synchronous and retain
+	 * the complete-reply framing and bounded deadline guarantees. */
+	ret = stop ? SR_ERR : bk1697_query(sdi, group_commands[group], group_replies[group], &r);
+	devc->refresh_group = (devc->refresh_group + 1) % 4;
 	end = FALSE;
 	if (ret != SR_OK)
 		bk1697_stop_locked(sdi, &end);
 	g_mutex_unlock(&devc->mutex);
 	if (end)
 		bk1697_send_end(sdi);
-	if (ret != SR_OK)
+	if (ret != SR_OK || group != BK1697_GETD)
 		return TRUE;
 
 	/* Each send can synchronously stop/close acquisition via user callbacks.
@@ -251,8 +349,10 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 		g_mutex_unlock(&devc->mutex);
 		return TRUE;
 	}
+	g_mutex_lock(&devc->cache_mutex);
 	sr_sw_limits_update_samples_read(&devc->limits, 1);
 	stop = sr_sw_limits_check(&devc->limits);
+	g_mutex_unlock(&devc->cache_mutex);
 	end = FALSE;
 	if (stop)
 		bk1697_stop_locked(sdi, &end);

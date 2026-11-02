@@ -24,6 +24,7 @@ static struct {
 	GPtrArray *commands;
 	GString *rx;
 	gboolean opened, wide, output_data, enabled;
+	gboolean ignore_setting, fail_readback;
 	gboolean hold, entered, contender, release, configured;
 	unsigned int opens, closes, flushes, adds, removes, prereads;
 	unsigned int headers, ends, frames, frame_ends, analogs, metas;
@@ -32,12 +33,15 @@ static struct {
 	char maximum[7];
 	enum injection inject;
 	gint64 completed, opened_at;
+	gboolean measure_gaps;
+	gint64 max_command_gap;
+	gint64 last_gets, last_gpal, gets_gap, gpal_gap;
 } wire;
 static struct sr_context *ctx;
 static struct sr_dev_driver *driver;
 static struct sr_dev_inst *device;
 static struct sr_session *session;
-static gboolean reentrant, stream_ended, close_packet, repeat_stop;
+static gboolean reentrant, stream_ended, close_packet, repeat_stop, live_status;
 static gboolean observer_ended;
 static unsigned int observer_ends;
 static int stop_packet;
@@ -106,8 +110,9 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 	g_assert_cmpuint(count, >, 1);
 	g_assert_cmpint(((const char *)buf)[count - 1], ==, '\r');
 	g_assert_cmpuint(wire.rx->len, ==, 0);
-	if (wire.completed)
-		g_assert_cmpint(g_get_monotonic_time() - wire.completed, >=, 100000);
+	if (wire.measure_gaps && wire.completed)
+		wire.max_command_gap = MAX(wire.max_command_gap,
+			g_get_monotonic_time() - wire.completed);
 	command = g_strndup(buf, count - 1);
 	g_ptr_array_add(wire.commands, command);
 	if (wire.inject == SHORT_WRITE || wire.inject == WRITE_ERROR) {
@@ -138,26 +143,40 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 	}
 	if (!strcmp(command, "GMAX00"))
 		g_string_printf(wire.rx, "%s\rOK\r", wire.maximum);
-	else if (!strcmp(command, "GETS00"))
+	else if (!strcmp(command, "GETS00")) {
+		gint64 now = g_get_monotonic_time();
+		if (wire.last_gets)
+			wire.gets_gap = MAX(wire.gets_gap, now - wire.last_gets);
+		wire.last_gets = now;
 		g_string_printf(wire.rx, "%03u%03u\rOK\r",
 			wire.voltage_count, wire.current_count);
+		if (wire.fail_readback)
+			wire.inject = READ_ERROR;
+	}
 	else if (!strcmp(command, "GETD00"))
 		g_string_assign(wire.rx, wire.wide ? "123405671\rOK\r" : "1230560\rOK\r");
 	else if (!strcmp(command, "GPAL00")) {
+		gint64 now = g_get_monotonic_time();
+		if (wire.last_gpal)
+			wire.gpal_gap = MAX(wire.gpal_gap, now - wire.last_gpal);
+		wire.last_gpal = now;
 		memset(panel, '0', 68);
 		memcpy(panel + 65, wire.enabled ? "01" : "10", 2);
 		memcpy(panel + 68, "\rOK\r", 5);
 		g_string_assign(wire.rx, panel);
 	} else if (g_str_has_prefix(command, "VOLT00")) {
 		g_assert_cmpuint(strlen(command), ==, 9);
-		wire.voltage_count = g_ascii_strtoull(command + 6, NULL, 10);
+		if (!wire.ignore_setting)
+			wire.voltage_count = g_ascii_strtoull(command + 6, NULL, 10);
 		g_string_assign(wire.rx, "OK\r");
 	} else if (g_str_has_prefix(command, "CURR00")) {
 		g_assert_cmpuint(strlen(command), ==, 9);
-		wire.current_count = g_ascii_strtoull(command + 6, NULL, 10);
+		if (!wire.ignore_setting)
+			wire.current_count = g_ascii_strtoull(command + 6, NULL, 10);
 		g_string_assign(wire.rx, "OK\r");
 	} else if (!strcmp(command, "SOUT000") || !strcmp(command, "SOUT001")) {
-		wire.enabled = command[6] == '0';
+		if (!wire.ignore_setting)
+			wire.enabled = command[6] == '0';
 		g_string_assign(wire.rx, wire.output_data ? "120050\rOK\r" : "OK\r");
 	} else
 		g_error("Unexpected command: %s", command);
@@ -205,7 +224,7 @@ int __wrap_serial_source_add(struct sr_session *s,
 {
 	(void)serial;
 	g_assert_cmpint(events, ==, G_IO_IN);
-	g_assert_cmpint(timeout, ==, 100);
+	g_assert_cmpint(timeout, ==, 10);
 	wire.adds++;
 	/* Use the real session event loop, with a timer instead of a serial fd. */
 	return sr_session_source_add(s, -1, 0, timeout, cb, data);
@@ -302,6 +321,7 @@ static void setup(void)
 	g_assert_cmpuint(wire.commands->len, ==, 8);
 	session = NULL;
 	reentrant = FALSE;
+	live_status = FALSE;
 	stream_ended = FALSE;
 	close_packet = FALSE;
 	repeat_stop = FALSE;
@@ -344,6 +364,8 @@ static void test_settings(void)
 	g_assert_cmpstr(g_variant_get_string(value, NULL), ==, "CV");
 	g_variant_unref(value);
 	wire.wide = TRUE;
+	/* Idle GETD cache must expire before switching the emulated format. */
+	g_usleep(260000);
 	check_double(SR_CONF_VOLTAGE, 12.34);
 	check_double(SR_CONF_CURRENT, 0.567);
 	value = get(SR_CONF_REGULATION);
@@ -380,7 +402,11 @@ static void test_settings(void)
 static void reconnect(void)
 {
 	unsigned int count = wire.commands->len;
+	GVariant *value = NULL;
 	g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+	g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_VOLTAGE, &value), !=, SR_OK);
+	g_assert(value == NULL);
+	g_assert_cmpuint(wire.commands->len, ==, count);
 	/* A late ACK must be flushed, not accepted by the next transaction. */
 	g_string_assign(wire.rx, "OK\r");
 	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
@@ -413,6 +439,9 @@ static void test_faults(void)
 	setup();
 	for (i = 0; i < G_N_ELEMENTS(faults); i++) {
 		g_test_message("fault injection %u", faults[i]);
+		/* Force the GPAL getter to the transport for fault injection. */
+		if (faults[i] == BAD_PANEL)
+			g_usleep(260000);
 		wire.inject = faults[i];
 		count = wire.commands->len;
 		if (faults[i] == BAD_PANEL) {
@@ -435,13 +464,15 @@ static void test_deadline(void)
 	GVariant *value = NULL;
 	gint64 start, elapsed;
 	setup();
+	/* Do not let the probe-seeded snapshot mask a transport deadline test. */
+	g_usleep(260000);
 	wire.inject = SLOW_REPLY;
 	start = g_get_monotonic_time();
 	g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_VOLTAGE, &value), !=, SR_OK);
 	elapsed = g_get_monotonic_time() - start;
 	g_assert((value) == NULL);
 	g_assert_cmpint(elapsed, >=, 2000000);
-	/* Include one pacing interval and scheduler slack, not another reply. */
+	/* Allow scheduler slack, not another reply deadline. */
 	g_assert_cmpint(elapsed, <, 3000000);
 	assert_latched();
 	wire.inject = NORMAL;
@@ -544,6 +575,20 @@ static void feed(const struct sr_dev_inst *sdi,
 		}
 		break;
 	default: g_error("Unexpected packet type %d", packet->type);
+	}
+	if (live_status && packet->type == SR_DF_FRAME_END && wire.frames >= 60) {
+		unsigned int count = wire.commands->len;
+		check_double(SR_CONF_VOLTAGE_TARGET, 13.5);
+		check_double(SR_CONF_CURRENT_LIMIT, 0.78);
+		value = get(SR_CONF_ENABLED);
+		g_assert(g_variant_get_boolean(value));
+		g_variant_unref(value);
+		check_double(SR_CONF_VOLTAGE, 12.3);
+		check_double(SR_CONF_CURRENT, 0.56);
+		value = get(SR_CONF_REGULATION);
+		g_assert_cmpstr(g_variant_get_string(value, NULL), ==, "CV");
+		g_variant_unref(value);
+		g_assert_cmpuint(wire.commands->len, ==, count);
 	}
 	if (packet->type == stop_packet) {
 		unsigned int count = wire.commands->len;
@@ -808,10 +853,282 @@ static void test_smaller_maximum(void)
 	teardown();
 }
 
+static gint64 getter_elapsed;
+static unsigned int getter_commands;
+
+static gpointer snapshot_getter(gpointer unused)
+{
+	static const uint32_t keys[] = { SR_CONF_VOLTAGE, SR_CONF_CURRENT,
+		SR_CONF_REGULATION, SR_CONF_VOLTAGE_TARGET, SR_CONF_CURRENT_LIMIT,
+		SR_CONF_ENABLED, SR_CONF_CONN, SR_CONF_LIMIT_SAMPLES };
+	GVariant *value;
+	gint64 start;
+	unsigned int i, count;
+	(void)unused;
+	g_mutex_lock(&wire.lock);
+	while (!wire.entered)
+		g_cond_wait(&wire.cond, &wire.lock);
+	count = wire.commands->len;
+	g_mutex_unlock(&wire.lock);
+	start = g_get_monotonic_time();
+	for (i = 0; i < G_N_ELEMENTS(keys); i++) {
+		value = get(keys[i]);
+		if (keys[i] == SR_CONF_VOLTAGE_TARGET)
+			g_assert_cmpfloat(g_variant_get_double(value), ==, 12.0);
+		g_variant_unref(value);
+	}
+	g_assert_cmpint(sr_config_list(driver, device, NULL, SR_CONF_VOLTAGE_TARGET, &value), ==, SR_OK);
+	g_variant_unref(value);
+	getter_elapsed = g_get_monotonic_time() - start;
+	g_mutex_lock(&wire.lock);
+	getter_commands = wire.commands->len - count;
+	wire.configured = TRUE;
+	g_cond_broadcast(&wire.cond);
+	g_mutex_unlock(&wire.lock);
+	return NULL;
+}
+
+static gpointer snapshot_watchdog(gpointer unused)
+{
+	gint64 deadline;
+	(void)unused;
+	g_mutex_lock(&wire.lock);
+	while (!wire.entered)
+		g_cond_wait(&wire.cond, &wire.lock);
+	deadline = g_get_monotonic_time() + 300000;
+	while (!wire.configured && g_cond_wait_until(&wire.cond, &wire.lock, deadline))
+		;
+	/* Always release: the unfixed getter must fail boundedly, not deadlock. */
+	wire.release = TRUE;
+	g_cond_broadcast(&wire.cond);
+	g_mutex_unlock(&wire.lock);
+	return NULL;
+}
+
+static void test_snapshot_latency(void)
+{
+	GThread *getter, *watchdog;
+	setup();
+	new_session(1, 0);
+	wire.hold = TRUE;
+	getter = g_thread_new("snapshot", snapshot_getter, NULL);
+	watchdog = g_thread_new("watchdog", snapshot_watchdog, NULL);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_thread_join(getter);
+	g_thread_join(watchdog);
+	g_test_message("held-wire getters: %.3f ms, %u extra commands",
+		getter_elapsed / 1000.0, getter_commands);
+	g_assert_cmpint(getter_elapsed, <, 50000);
+	g_assert_cmpuint(getter_commands, ==, 0);
+	teardown();
+}
+
+static gpointer snapshot_setter(gpointer unused)
+{
+	(void)unused;
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
+	return NULL;
+}
+
+static void test_active_setter_snapshot(void)
+{
+	GThread *setter, *getter, *watchdog;
+	setup();
+	new_session(1, 0);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	/* Hold the setter ACK, not an acquisition reply. The previous actual
+	 * GETS must remain available without borrowing the setter's wire lock. */
+	wire.hold = TRUE;
+	setter = g_thread_new("setter", snapshot_setter, NULL);
+	getter = g_thread_new("snapshot", snapshot_getter, NULL);
+	watchdog = g_thread_new("watchdog", snapshot_watchdog, NULL);
+	g_thread_join(getter);
+	g_thread_join(watchdog);
+	g_thread_join(setter);
+	g_test_message("active-setter getters: %.3f ms, %u extra commands",
+		getter_elapsed / 1000.0, getter_commands);
+	g_assert_cmpint(getter_elapsed, <, 50000);
+	g_assert_cmpuint(getter_commands, ==, 0);
+	check_double(SR_CONF_VOLTAGE_TARGET, 13);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	teardown();
+}
+
+static void test_idle_groups(void)
+{
+	GVariant *value;
+	unsigned int count;
+	gint64 start;
+	setup();
+	/* Probe seeds all groups. GETD and GPAL are still inside the idle TTL. */
+	count = wire.commands->len;
+	check_double(SR_CONF_VOLTAGE, 12.3);
+	check_double(SR_CONF_CURRENT, 0.56);
+	value = get(SR_CONF_REGULATION);
+	g_variant_unref(value);
+	value = get(SR_CONF_ENABLED);
+	g_variant_unref(value);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	g_usleep(260000);
+	wire.voltage_count = 135;
+	wire.current_count = 78;
+	count = wire.commands->len;
+	start = g_get_monotonic_time();
+	check_double(SR_CONF_VOLTAGE_TARGET, 13.5);
+	check_double(SR_CONF_CURRENT_LIMIT, 0.78);
+	g_test_message("idle GETS pair: %.3f ms", (g_get_monotonic_time() - start) / 1000.0);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	count = wire.commands->len;
+	check_double(SR_CONF_VOLTAGE, 12.3);
+	check_double(SR_CONF_CURRENT, 0.56);
+	value = get(SR_CONF_REGULATION);
+	g_variant_unref(value);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETD00");
+	wire.enabled = TRUE;
+	count = wire.commands->len;
+	value = get(SR_CONF_ENABLED);
+	g_assert(g_variant_get_boolean(value));
+	g_variant_unref(value);
+	value = get(SR_CONF_ENABLED);
+	g_variant_unref(value);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GPAL00");
+	g_usleep(260000);
+	wire.voltage_count = 140;
+	count = wire.commands->len;
+	check_double(SR_CONF_VOLTAGE_TARGET, 14);
+	check_double(SR_CONF_CURRENT_LIMIT, 0.78);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	reconnect();
+	check_double(SR_CONF_VOLTAGE_TARGET, 14);
+	teardown();
+}
+
+static void test_actual_readback(void)
+{
+	GVariant *value;
+	unsigned int count;
+	setup();
+	/* ACK does not prove the requested value became actual. */
+	wire.ignore_setting = TRUE;
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 2);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GETS00");
+	check_double(SR_CONF_VOLTAGE_TARGET, 12);
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_CURRENT_LIMIT, g_variant_new_double(1)), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 2);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GETS00");
+	check_double(SR_CONF_CURRENT_LIMIT, 0.5);
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 2);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GPAL00");
+	value = get(SR_CONF_ENABLED);
+	g_assert(!g_variant_get_boolean(value));
+	g_variant_unref(value);
+	wire.fail_readback = TRUE;
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), !=, SR_OK);
+	/* The write ACK must succeed; inject failure in its actual GETS reply. */
+	g_assert_cmpuint(wire.commands->len, ==, count + 2);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GETS00");
+	assert_latched();
+	wire.fail_readback = FALSE;
+	reconnect();
+	check_double(SR_CONF_VOLTAGE_TARGET, 12);
+	teardown();
+}
+
+static void test_live_status(void)
+{
+	unsigned int start, i, measurements = 0, settings = 0, panels = 0;
+	const char *command;
+	setup();
+	wire.voltage_count = 135;
+	wire.current_count = 78;
+	wire.enabled = TRUE;
+	live_status = TRUE;
+	wire.last_gets = wire.last_gpal = g_get_monotonic_time();
+	wire.gets_gap = wire.gpal_gap = 0;
+	/* With no command spacing, run long enough for two 500 ms refreshes
+	 * of each status group; retain exact GETD/sample accounting. */
+	new_session(120, 0);
+	start = wire.commands->len;
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	for (i = start; i < wire.commands->len; i++) {
+		command = g_ptr_array_index(wire.commands, i);
+		if (!strcmp(command, "GETD00"))
+			measurements++;
+		else if (!strcmp(command, "GETS00"))
+			settings++;
+		else if (!strcmp(command, "GPAL00"))
+			panels++;
+		else
+			g_assert_not_reached();
+	}
+	g_assert_cmpuint(measurements, ==, 120);
+	g_assert_cmpuint(wire.frames, ==, 120);
+	g_assert_cmpuint(settings, >=, 2);
+	g_assert_cmpuint(panels, >=, 2);
+	/* Include the final partial interval, with timer/scheduler slack. */
+	g_assert_cmpint(MAX(wire.gets_gap, g_get_monotonic_time() - wire.last_gets), <, 1100000);
+	g_assert_cmpint(MAX(wire.gpal_gap, g_get_monotonic_time() - wire.last_gpal), <, 1100000);
+	g_test_message("live status maximum gaps: GETS %.3f ms, GPAL %.3f ms",
+		wire.gets_gap / 1000.0, wire.gpal_gap / 1000.0);
+	teardown();
+}
+
+static void test_no_command_spacing(void)
+{
+	static const char *expected[] = {
+		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00",
+		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00"
+	};
+	unsigned int start, i;
+	gint64 began, elapsed;
+
+	setup();
+	start = wire.commands->len;
+	wire.measure_gaps = TRUE;
+	began = g_get_monotonic_time();
+	for (i = 0; i < 2; i++) {
+		g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
+		g_assert_cmpint(set(SR_CONF_CURRENT_LIMIT, g_variant_new_double(0.7)), ==, SR_OK);
+		g_assert_cmpint(set(SR_CONF_ENABLED, g_variant_new_boolean(TRUE)), ==, SR_OK);
+	}
+	elapsed = g_get_monotonic_time() - began;
+	wire.measure_gaps = FALSE;
+	/* All commands are actual writes/readbacks, not cache hits. No session
+	 * timer, TTL expiry or artificial serial latency is in this window. */
+	g_assert_cmpuint(wire.commands->len, ==, start + G_N_ELEMENTS(expected));
+	for (i = 0; i < G_N_ELEMENTS(expected); i++)
+		g_assert_cmpstr(g_ptr_array_index(wire.commands, start + i), ==, expected[i]);
+	g_assert_cmpuint(wire.rx->len, ==, 0);
+	g_test_message("12 uncached commands: %.3f ms total, %.3f ms maximum reply-to-command gap",
+		elapsed / 1000.0, wire.max_command_gap / 1000.0);
+	g_assert_cmpint(wire.max_command_gap, <, 80000);
+	g_assert_cmpint(elapsed, <, 80000);
+	check_double(SR_CONF_VOLTAGE_TARGET, 13);
+	check_double(SR_CONF_CURRENT_LIMIT, 0.7);
+	teardown();
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	sr_log_loglevel_set(SR_LOG_NONE);
+	g_test_add_func("/bk1697/no-command-spacing", test_no_command_spacing);
+	g_test_add_func("/bk1697/active-setter-snapshot", test_active_setter_snapshot);
+	g_test_add_func("/bk1697/idle-groups", test_idle_groups);
+	g_test_add_func("/bk1697/actual-readback", test_actual_readback);
+	g_test_add_func("/bk1697/live-status", test_live_status);
+	g_test_add_func("/bk1697/snapshot-latency", test_snapshot_latency);
 	g_test_add_func("/bk1697/settings", test_settings);
 	g_test_add_func("/bk1697/faults-reconnect", test_faults);
 	g_test_add_func("/bk1697/deadline", test_deadline);

@@ -35,6 +35,7 @@ static void clear_private(void *priv)
 
 	devc = priv;
 	g_mutex_clear(&devc->mutex);
+	g_mutex_clear(&devc->cache_mutex);
 }
 
 static int dev_clear(const struct sr_dev_driver *di)
@@ -53,6 +54,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 		ret = devc->faulted ? SR_ERR : SR_OK;
 		goto out;
 	}
+	bk1697_invalidate(devc);
 	ret = serial_open(sdi->conn, SERIAL_RDWR);
 	if (ret != SR_OK)
 		goto out;
@@ -66,7 +68,6 @@ static int dev_open(struct sr_dev_inst *sdi)
 	}
 	devc->opened = TRUE;
 	devc->faulted = FALSE;
-	devc->next_command = g_get_monotonic_time() + 100000;
 	/* Revalidate after reconnect, using read-only commands exclusively. */
 	ret = bk1697_probe(sdi);
 	if (ret != SR_OK) {
@@ -91,6 +92,7 @@ static int dev_close(struct sr_dev_inst *sdi)
 	ret = bk1697_stop_locked(sdi, &end);
 	close_ret = devc->opened ? serial_close(sdi->conn) : SR_OK;
 	devc->opened = FALSE;
+	bk1697_invalidate(devc);
 	/* In particular, no SOUT, remote/local or key-lock commands here. */
 	g_mutex_unlock(&devc->mutex);
 	if (end)
@@ -130,6 +132,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	devc = g_malloc0(sizeof(*devc));
 	sdi->priv = devc;
 	g_mutex_init(&devc->mutex);
+	g_mutex_init(&devc->cache_mutex);
 	sr_sw_limits_init(&devc->limits);
 	if (dev_open(sdi) != SR_OK) {
 		sr_serial_dev_inst_free(sdi->conn);
@@ -153,7 +156,6 @@ static int config_get(uint32_t key, GVariant **data,
 
 	(void)cg;
 	devc = sdi->priv;
-	g_mutex_lock(&devc->mutex);
 	ret = SR_OK;
 	switch (key) {
 	case SR_CONF_CONN:
@@ -161,18 +163,20 @@ static int config_get(uint32_t key, GVariant **data,
 		break;
 	case SR_CONF_LIMIT_SAMPLES:
 	case SR_CONF_LIMIT_MSEC:
+		g_mutex_lock(&devc->cache_mutex);
 		ret = sr_sw_limits_config_get(&devc->limits, key, data);
+		g_mutex_unlock(&devc->cache_mutex);
 		break;
 	case SR_CONF_VOLTAGE_TARGET:
 	case SR_CONF_CURRENT_LIMIT:
-		ret = bk1697_query(sdi, "GETS00", BK1697_VALUES, &r);
+		ret = bk1697_get(sdi, BK1697_GETS, &r);
 		if (ret == SR_OK)
 			*data = g_variant_new_double(key == SR_CONF_VOLTAGE_TARGET ? r.voltage : r.current);
 		break;
 	case SR_CONF_VOLTAGE:
 	case SR_CONF_CURRENT:
 	case SR_CONF_REGULATION:
-		ret = bk1697_query(sdi, "GETD00", BK1697_MEASUREMENT, &r);
+		ret = bk1697_get(sdi, BK1697_GETD, &r);
 		if (ret != SR_OK)
 			break;
 		if (key == SR_CONF_REGULATION)
@@ -181,14 +185,13 @@ static int config_get(uint32_t key, GVariant **data,
 			*data = g_variant_new_double(key == SR_CONF_VOLTAGE ? r.voltage : r.current);
 		break;
 	case SR_CONF_ENABLED:
-		ret = bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
+		ret = bk1697_get(sdi, BK1697_GPAL, &r);
 		if (ret == SR_OK)
 			*data = g_variant_new_boolean(r.enabled);
 		break;
 	default:
 		ret = SR_ERR_NA;
 	}
-	g_mutex_unlock(&devc->mutex);
 	return ret;
 }
 
@@ -209,7 +212,9 @@ static int config_set(uint32_t key, GVariant *data,
 	switch (key) {
 	case SR_CONF_LIMIT_SAMPLES:
 	case SR_CONF_LIMIT_MSEC:
+		g_mutex_lock(&devc->cache_mutex);
 		ret = sr_sw_limits_config_set(&devc->limits, key, data);
+		g_mutex_unlock(&devc->cache_mutex);
 		break;
 	case SR_CONF_VOLTAGE_TARGET:
 	case SR_CONF_CURRENT_LIMIT:
@@ -230,12 +235,16 @@ static int config_set(uint32_t key, GVariant *data,
 			g_snprintf(command, sizeof(command), "CURR00%03u", counts);
 		}
 		ret = bk1697_query(sdi, command, BK1697_ACK, &r);
+		if (ret == SR_OK)
+			ret = bk1697_query(sdi, "GETS00", BK1697_VALUES, &r);
 		break;
 	case SR_CONF_ENABLED:
 		/* Zero enables output; one disables. Accept ACK-only firmware and
 		 * manual V/I-plus-ACK, consuming both lines in the latter case. */
 		ret = bk1697_query(sdi, g_variant_get_boolean(data) ? "SOUT000" : "SOUT001",
 			BK1697_OUTPUT, &r);
+		if (ret == SR_OK)
+			ret = bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
 		break;
 	default:
 		ret = SR_ERR_NA;
@@ -258,12 +267,12 @@ static int config_list(uint32_t key, GVariant **data,
 	case SR_CONF_CURRENT_LIMIT:
 		if (!devc)
 			return SR_ERR_ARG;
-		g_mutex_lock(&devc->mutex);
+		g_mutex_lock(&devc->cache_mutex);
 		if (key == SR_CONF_VOLTAGE_TARGET)
 			*data = std_gvar_min_max_step(1.0, MIN(40.0, devc->maximum.voltage), 0.1);
 		else
 			*data = std_gvar_min_max_step(0.01, MIN(5.0, devc->maximum.current), 0.01);
-		g_mutex_unlock(&devc->mutex);
+		g_mutex_unlock(&devc->cache_mutex);
 		return SR_OK;
 	default:
 		return SR_ERR_NA;
@@ -281,15 +290,20 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		g_mutex_unlock(&devc->mutex);
 		return SR_ERR;
 	}
-	ret = serial_source_add(sdi->session, sdi->conn, G_IO_IN, 100,
+	ret = serial_source_add(sdi->session, sdi->conn, G_IO_IN, 10,
 		bk1697_receive_data, (void *)sdi);
 	if (ret == SR_OK) {
 		devc->active = TRUE;
+		g_mutex_lock(&devc->cache_mutex);
+		devc->cache_active = TRUE;
+		g_mutex_unlock(&devc->cache_mutex);
 		devc->generation++;
 		/* Reserve HEADER before releasing the mutex: close/stop can then
 		 * defer END until HEADER has reached every session callback. */
 		devc->sending = TRUE;
+		g_mutex_lock(&devc->cache_mutex);
 		sr_sw_limits_acquisition_start(&devc->limits);
+		g_mutex_unlock(&devc->cache_mutex);
 	}
 	g_mutex_unlock(&devc->mutex);
 	if (ret == SR_OK) {
