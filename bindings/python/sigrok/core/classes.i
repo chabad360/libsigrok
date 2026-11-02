@@ -62,6 +62,13 @@ typedef guint pyg_flags_type;
 #endif
 
 #if PY_VERSION_HEX >= 0x03000000
+/* SWIG 4.5 no longer supplies the Python 2 integer compatibility aliases. */
+#ifndef PyInt_Check
+#define PyInt_Check PyLong_Check
+#endif
+#ifndef PyInt_AsLong
+#define PyInt_AsLong PyLong_AsLong
+#endif
 #define string_check PyUnicode_Check
 #define string_from_python PyUnicode_AsUTF8
 #define string_to_python PyUnicode_FromString
