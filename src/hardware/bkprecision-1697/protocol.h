@@ -13,16 +13,31 @@
 
 #define LOG_PREFIX "bkprecision-1697"
 
+enum bk1697_group { BK1697_GETD, BK1697_GETS, BK1697_GPAL, BK1697_GROUPS };
+
+struct bk1697_snapshot {
+	struct bk1697_response response;
+	int64_t updated;
+	gboolean valid;
+};
+
 struct dev_context {
 	struct sr_sw_limits limits;
-	GMutex mutex;
+	/* Lock order: wire mutex -> cache_mutex; never I/O under cache_mutex.
+	 * limits use cache_mutex; maximum writers hold both, readers either. */
+	GMutex mutex, cache_mutex;
+	gboolean cache_ready, cache_active;
+	struct bk1697_snapshot cache[BK1697_GROUPS];
+	unsigned int refresh_group;
 	gboolean opened, faulted;
 	gboolean active, stopping, sending;
 	uint64_t generation;
-	int64_t next_command;
 	struct bk1697_response maximum;
 };
 
+SR_PRIV void bk1697_invalidate(struct dev_context *devc);
+SR_PRIV int bk1697_get(const struct sr_dev_inst *sdi, enum bk1697_group group,
+	struct bk1697_response *response);
 /* Query/probe callers hold devc->mutex throughout the wire transaction. */
 SR_PRIV int bk1697_query(const struct sr_dev_inst *sdi, const char *command,
 	enum bk1697_reply kind, struct bk1697_response *response);
