@@ -22,6 +22,11 @@ static const struct {
 	{ "GOVP00", BK1697_UPPER_VOLTAGE },
 };
 
+static const enum bk1697_group poll_sequence[] = {
+	BK1697_GETD, BK1697_GETS, BK1697_GETD,
+	BK1697_GPAL, BK1697_GETD, BK1697_GOVP,
+};
+
 /* Called under the wire mutex. Invalidate all groups as one short operation. */
 SR_PRIV void bk1697_invalidate(struct dev_context *devc)
 {
@@ -292,10 +297,9 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	generation = devc->generation;
 	g_mutex_lock(&devc->cache_mutex);
 	stop = sr_sw_limits_check(&devc->limits);
-	group = BK1697_GETD;
-	/* Alternate measurement with age-gated GETS, GPAL, GOVP slots. */
-	if (devc->refresh_group % 2) {
-		group = BK1697_GETS + devc->refresh_group / 2;
+	group = poll_sequence[devc->refresh_group];
+	/* Fresh status slots fall back to measurement without delaying polling. */
+	if (group != BK1697_GETD) {
 		updated = devc->cache[group].updated;
 		if (g_get_monotonic_time() - updated < STATUS_REFRESH_US)
 			group = BK1697_GETD;
@@ -304,7 +308,7 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	/* No inter-command delay: physical reads remain synchronous and retain
 	 * the complete-reply framing and bounded deadline guarantees. */
 	ret = stop ? SR_ERR : bk1697_query_group(sdi, group, &r);
-	devc->refresh_group = (devc->refresh_group + 1) % 6;
+	devc->refresh_group = (devc->refresh_group + 1) % G_N_ELEMENTS(poll_sequence);
 	end = FALSE;
 	if (ret != SR_OK)
 		bk1697_stop_locked(sdi, &end);

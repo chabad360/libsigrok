@@ -55,8 +55,12 @@ remains the actual FAULT/OVP lamp state; it is not inferred from GOVP.
   undocumented. Lower the target explicitly first. Equality is permitted.
 - Nonfinite, off-step and out-of-range inputs are rejected without mutating
   commands. Invalid precision/envelope requests need no prequery. ACKs alone do
-  not establish actual settings: ignored writes leave actual readback in cache,
-  and failed readbacks fault rather than fabricating a threshold.
+  not establish actual settings: a valid threshold readback that differs from the
+  canonical request (`counts / 10.0`) returns `SR_ERR` and logs requested/actual
+  volts. It retains the actual cache, does not retry or latch a communication
+  fault, and permits a subsequent SET without reopening. This mismatch check is
+  specific to the threshold; existing voltage/current setter behavior is unchanged.
+  Transport/framing readback failures still fault rather than fabricating a value.
 - Periodic GOVP polls publish standard threshold metadata for front-panel
   changes. Target LIST shares GOVP's cache (250 ms idle TTL, last actual snapshot
   while acquiring); target SET always rechecks the wire. Protection against
@@ -93,8 +97,10 @@ the preceding actual snapshot until readback completes.
 passed 30/30 for each. Therefore only VOLT/CURR wait 1 ms before their GETS
 readback. SOUT001-to-GPAL passed 30/30 without a gap and is not delayed. This is
 observed compatibility handling, not a manufacturer timing specification.
-SOVP has no measured post-ACK timing yet and deliberately has **no delay** before
-mandatory GOVP readback; parent-owned direct 0 vs 1 ms measurements are pending.
+Parent direct SOVP-ACK-to-GOVP trials passed **30/30 at zero gap** and **30/30 at
+1 ms**, alternating 5/6 V limits and restoring 40.2 V. Therefore SOVP retains
+**no delay** before mandatory GOVP readback. Evidence:
+`bk1697/libsigrok/hardware-ovp-timing.log` relative to the workspace root.
 
 Wire transactions and lifecycle changes use a wire mutex; snapshots and local
 limits use a short cache mutex. Lock order is wire then cache. Cache access never
@@ -128,7 +134,20 @@ See `tests/bk1697-driver.md` for framing, bounds, cached latency, actual-readbac
 concurrency, lifecycle, timer-source and OVP-metadata regressions. No hardware is
 opened by these tests.
 
-On the tested unit, actual SmuView 0.0.4 startup improved from 7.60 s to 0.55 s,
+Parent hardware/GUI OVP evidence (logs under workspace-root `bk1697/libsigrok/`):
+
+- `hardware-ovp-driver.log`: actual driver limits 5/6/5 V read back correctly,
+  then 40.2 V was restored. Software guards rejected a ceiling below the target,
+  out-of-range/off-step/nonfinite limits and a target above the ceiling. Physical
+  target **4.2 V**, current limit **3.5 A** and output **OFF** were preserved.
+- `gui-ovp-control-heartbeat.log`: actual SmuView **0.0.4** numeric OVP field
+  enabled, min **1**, max **40.2**, step **0.1 V**, values
+  **40.2 -> 5 -> 6 -> 40.2 V**. The enable toggle remained disabled as unsupported
+  (`toggle_enabled=false`); the OVP LED remained inactive. Startup was
+  **713.776 ms (about 714 ms)**. These are parent measurements of the preceding
+  GOVP/SOVP implementation, not a hardware retest of the mismatch fix.
+
+On an earlier tested build, actual SmuView 0.0.4 startup improved from 7.60 s to 0.55 s,
 and a nine-getter batch from 1232 ms to approximately 0.14 ms. A subsequent
 low-voltage exercise and 500-sample capture completed at approximately 25 Hz,
 including successful settings/output restoration. These results are not loaded

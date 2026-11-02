@@ -294,6 +294,13 @@ static int config_set(uint32_t key, GVariant *data,
 		if (key == SR_CONF_VOLTAGE_TARGET || key == SR_CONF_CURRENT_LIMIT)
 			g_usleep(1000);
 		ret = bk1697_query_group(sdi, group, &r);
+		if (ret == SR_OK && key == SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD &&
+			r.voltage != counts / 10.0) {
+			sr_err("Upper voltage limit SET was not applied: requested %.1f V, read back %.1f V.",
+				counts / 10.0, r.voltage);
+			/* Valid actual readback stays cached; no retry or transport fault. */
+			ret = SR_ERR;
+		}
 	}
 	end = FALSE;
 	if (devc->faulted)
