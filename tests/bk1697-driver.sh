@@ -27,5 +27,6 @@ ${CC:-cc} -std=c99 -Wall -Wextra -Werror \
     -Wl,--wrap=serial_open,--wrap=serial_close,--wrap=serial_flush \
     -Wl,--wrap=serial_read_nonblocking,--wrap=serial_read_blocking \
     -Wl,--wrap=serial_write_blocking,--wrap=serial_source_add,--wrap=serial_source_remove \
+    -Wl,--wrap=sr_session_fd_source_add,--wrap=sr_session_source_remove_internal \
     $libs -lm -o "$exe"
 "$exe" "$@"

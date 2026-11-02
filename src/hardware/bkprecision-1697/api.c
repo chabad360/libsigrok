@@ -27,6 +27,7 @@ static const uint32_t devopts[] = {
 	SR_CONF_CURRENT_LIMIT | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 	SR_CONF_ENABLED | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_REGULATION | SR_CONF_GET,
+	SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE | SR_CONF_GET,
 };
 
 static void clear_private(void *priv)
@@ -58,9 +59,7 @@ static int dev_open(struct sr_dev_inst *sdi)
 	ret = serial_open(sdi->conn, SERIAL_RDWR);
 	if (ret != SR_OK)
 		goto out;
-	/* Let any previous bounded transaction finish before discarding stale
-	 * input on an explicit reconnect. Never purge within a transaction. */
-	g_usleep(2000000);
+	/* Explicit open discards queued input before the read-only probe. */
 	ret = serial_flush(sdi->conn);
 	if (ret != SR_OK) {
 		serial_close(sdi->conn);
@@ -185,9 +184,10 @@ static int config_get(uint32_t key, GVariant **data,
 			*data = g_variant_new_double(key == SR_CONF_VOLTAGE ? r.voltage : r.current);
 		break;
 	case SR_CONF_ENABLED:
+	case SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE:
 		ret = bk1697_get(sdi, BK1697_GPAL, &r);
 		if (ret == SR_OK)
-			*data = g_variant_new_boolean(r.enabled);
+			*data = g_variant_new_boolean(key == SR_CONF_ENABLED ? r.enabled : r.ovp_active);
 		break;
 	default:
 		ret = SR_ERR_NA;
@@ -202,20 +202,22 @@ static int config_set(uint32_t key, GVariant *data,
 	struct bk1697_response r;
 	unsigned int counts;
 	char command[16];
+	enum bk1697_group group;
 	double value, maximum;
+	gboolean end;
 	int ret;
 
 	(void)cg;
 	devc = sdi->priv;
-	g_mutex_lock(&devc->mutex);
-	ret = SR_OK;
-	switch (key) {
-	case SR_CONF_LIMIT_SAMPLES:
-	case SR_CONF_LIMIT_MSEC:
+	if (key == SR_CONF_LIMIT_SAMPLES || key == SR_CONF_LIMIT_MSEC) {
 		g_mutex_lock(&devc->cache_mutex);
 		ret = sr_sw_limits_config_set(&devc->limits, key, data);
 		g_mutex_unlock(&devc->cache_mutex);
-		break;
+		return ret;
+	}
+	g_mutex_lock(&devc->mutex);
+	ret = SR_OK;
+	switch (key) {
 	case SR_CONF_VOLTAGE_TARGET:
 	case SR_CONF_CURRENT_LIMIT:
 		value = g_variant_get_double(data);
@@ -234,22 +236,39 @@ static int config_set(uint32_t key, GVariant *data,
 			}
 			g_snprintf(command, sizeof(command), "CURR00%03u", counts);
 		}
+		group = BK1697_GETS;
 		ret = bk1697_query(sdi, command, BK1697_ACK, &r);
-		if (ret == SR_OK)
-			ret = bk1697_query(sdi, "GETS00", BK1697_VALUES, &r);
 		break;
 	case SR_CONF_ENABLED:
 		/* Zero enables output; one disables. Accept ACK-only firmware and
 		 * manual V/I-plus-ACK, consuming both lines in the latter case. */
+		group = BK1697_GPAL;
 		ret = bk1697_query(sdi, g_variant_get_boolean(data) ? "SOUT000" : "SOUT001",
 			BK1697_OUTPUT, &r);
-		if (ret == SR_OK)
-			ret = bk1697_query(sdi, "GPAL00", BK1697_PANEL, &r);
 		break;
 	default:
 		ret = SR_ERR_NA;
 	}
+	if (ret == SR_OK) {
+		/* Retain the previous actual snapshot for active readers until
+		 * readback, but expire idle reuse immediately after the ACK. */
+		g_mutex_lock(&devc->cache_mutex);
+		devc->cache[group].updated = 0;
+		g_mutex_unlock(&devc->cache_mutex);
+		/* Observed firmware drops immediate GETS after VOLT/CURR ACK:
+		 * parent stress logs found 23/30 and 26/30 successes at 0 ms,
+		 * both 30/30 at 1 ms. SOUT001->GPAL passed 30/30 without a gap.
+		 * This is an observed workaround, not a manufacturer timing spec. */
+		if (key == SR_CONF_VOLTAGE_TARGET || key == SR_CONF_CURRENT_LIMIT)
+			g_usleep(1000);
+		ret = bk1697_query_group(sdi, group, &r);
+	}
+	end = FALSE;
+	if (devc->faulted)
+		bk1697_stop_locked(sdi, &end);
 	g_mutex_unlock(&devc->mutex);
+	if (end)
+		bk1697_send_end(sdi);
 	return ret;
 }
 
@@ -290,7 +309,7 @@ static int dev_acquisition_start(const struct sr_dev_inst *sdi)
 		g_mutex_unlock(&devc->mutex);
 		return SR_ERR;
 	}
-	ret = serial_source_add(sdi->session, sdi->conn, G_IO_IN, 10,
+	ret = sr_session_fd_source_add(sdi->session, (void *)sdi, -1, 0, 10,
 		bk1697_receive_data, (void *)sdi);
 	if (ret == SR_OK) {
 		devc->active = TRUE;

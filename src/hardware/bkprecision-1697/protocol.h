@@ -18,7 +18,6 @@ enum bk1697_group { BK1697_GETD, BK1697_GETS, BK1697_GPAL, BK1697_GROUPS };
 struct bk1697_snapshot {
 	struct bk1697_response response;
 	int64_t updated;
-	gboolean valid;
 };
 
 struct dev_context {
@@ -41,6 +40,8 @@ SR_PRIV int bk1697_get(const struct sr_dev_inst *sdi, enum bk1697_group group,
 /* Query/probe callers hold devc->mutex throughout the wire transaction. */
 SR_PRIV int bk1697_query(const struct sr_dev_inst *sdi, const char *command,
 	enum bk1697_reply kind, struct bk1697_response *response);
+SR_PRIV int bk1697_query_group(const struct sr_dev_inst *sdi,
+	enum bk1697_group group, struct bk1697_response *response);
 SR_PRIV int bk1697_probe(const struct sr_dev_inst *sdi);
 /* Stop under devc->mutex, then send END unlocked only if claimed by end. */
 SR_PRIV int bk1697_stop_locked(const struct sr_dev_inst *sdi, gboolean *end);

@@ -13,7 +13,8 @@ output.
 ## Capabilities and protocol
 
 - Voltage/current analog acquisition, sample/time limits, actual queried voltage
-  target/current limit, GPAL output-state readback, and CV/CC regulation.
+  target/current limit, GPAL output-state and FAULT/OVP-active readback, and CV/CC
+  regulation. `over-voltage-protection-active` is read-only.
 - GMAX/GETS: three-digit voltage/current fields, /10 V and /100 A. Observed
   GMAX `402502` means 40.2 V / 5.02 A; readback retains that headroom.
 - Writes: nominal 1–40 V in 0.1 V steps and 0.01–5 A in 0.01 A steps, further
@@ -24,13 +25,19 @@ output.
 - Output state uses complementary active-low GPAL ON/OFF indicators, never
   inferred from voltage. SOUT zero enables, one disables; both ACK-only and
   six-digit-data-plus-ACK reply variants are consumed completely.
+- GPAL character 65 (zero-based index 64) is the active-low FAULT/OVP lamp:
+  `0` means active, `1` inactive; other characters are rejected. The OVP getter
+  shares the GPAL cache with output state. Each normal acquisition GPAL poll
+  publishes boolean OVP metadata so the frontend can update its OVP indicator.
+  This is not inferred from measured voltage, output state or transport errors.
 - CR framing, no CRLF. Replies are bounded to 72 bytes and a two-second
   transaction deadline, with up to 500 ms per byte read/write. Commands are
-  mutex-serialized through the complete reply, with no inserted inter-command
-  delay. No verified manufacturer requirement supports the former 100 ms gap.
+  mutex-serialized through the complete reply, with no blanket inter-command
+  delay. Successful VOLT and CURR ACKs wait 1 ms before mandatory GETS readback;
+  SOUT and ordinary GETS/GETD/GPAL queries have no inserted delay.
 - Framing/I/O failure latches a fault. There is no automatic retry, including
   ambiguous writes or OFF. Inspect physical output if communication fails.
-  Explicit close/open waits two seconds, flushes stale buffers, and re-probes;
+  Explicit close/open flushes queued input and runs the read-only probe;
   it never repeats a failed setting. Query state before deciding further action.
 
 ## Backend responsiveness and freshness
@@ -40,7 +47,9 @@ Complete validated GETD (V/I/regulation), GETS (target/limit) and GPAL
 open probe seeds all three; it adds no discovery commands. Acquisition getters
 return the last validated group under a separate short mutex, even while a
 serial reply or setter holds the wire mutex. Connection ID is immutable; limit
-and range reads also avoid the wire mutex. There is no worker thread/framework.
+and range reads also avoid the wire mutex. Local sample/time-limit setters use
+only the same short cache mutex, even while serial I/O is blocked. There is no
+worker thread/framework.
 
 Outside acquisition, groups are reused for 250 ms from reply completion; an
 expired group is actually queried, with a second cache check after taking the
@@ -50,27 +59,63 @@ Acquisition readers may see the previous acknowledged actual snapshot while a
 setter completes, never a fabricated requested value. Any transaction fault or
 close invalidates all groups; reconnect publishes usable snapshots only after
 the complete probe succeeds. Each group is coherent, not an atomic snapshot
-across all groups or across separate frontend getter calls.
+across all groups or across separate frontend getter calls. A single
+`cache_ready` gate is published only after all groups are seeded; there are no
+per-snapshot valid flags. A small typed query table/helper selects GETD/GETS/GPAL,
+validates their envelopes and publishes snapshots. The wire-query routine only
+handles the serialized framed transaction, not reverse command-name lookup.
 
-A 10 ms source timer attempts the wire mutex without waiting and defers only
+A real timer-only source (fd=-1, events=0) is keyed by the device instance and
+removed by that same key, so multiple timers do not share an application-wide
+-1 source key. Its 10 ms callback attempts the wire mutex and defers only
 when it is busy. This timer is a polling tick, not an inter-command delay; idle
-queries and mandatory setter readbacks can run back-to-back. GETD slots alternate
+queries and SOUT readbacks can run back-to-back. GETD slots alternate
 with age-gated GETS/GPAL slots (500 ms minimum refresh age; approximately 0.5–1 s
 status refresh on a responsive, uncontended link). Only GETD counts as a sample.
-No inter-command pacing state or sleep remains. Physical I/O is still synchronous
+No global pacing state or open quarantine remains. The scoped VOLT/CURR wait never
+holds the cache mutex. Physical I/O is still synchronous
 and bounded by the existing two-second transaction deadline: slow hardware can
 still block the session thread, setters still wait for serial access, and
 competing writes/slow replies can delay status refresh.
 Lock order is wire then cache, never cache then wire; the cache lock never
-covers serial I/O, sleeps or session callbacks.
+covers serial I/O, sleeps or session callbacks. A wire fault in an active setter
+stops acquisition immediately; END is sent unlocked, or deferred until the
+current session packet has reached every callback.
 
 Offline held-wire getter latency fell from 900.760 ms / six extra commands to
 under 1 ms / zero extra commands (50 ms regression threshold); see the exact
 measurements and commands in `tests/bk1697-driver.md`. This is a backend serial-
 seam measurement, **not a SmuView UI measurement**. A subsequent no-delay
 regression over six setters plus their six actual readbacks fell from
-1200.969 ms to 0.114 ms on the instantaneous serial model. The two-second
-open quarantine remains separate and unchanged.
+1200.969 ms to 0.114 ms on the instantaneous serial model. The subsequent
+simplification removed the unconditional open quarantine: open/flush/probe
+changed from 2000.098 ms to 0.006 ms, and held-wire local limit set/get from
+300.125 ms to 0.039 ms. No quiet-delay substitute was added. Only queued-input
+flush and a successful fresh probe are required for explicit reconnect; no
+automatic replay of an ambiguous write was added.
+
+## Observed setting readback timing (parent hardware evidence)
+
+The parent traced dropped GETS replies immediately following successful VOLT
+ACKs. Its existing `bk1697/libsigrok/hardware-write-timing-stress.log` reports
+30 direct-serial iterations with output OFF, alternating 1.5/1.6 V: 23/30
+successes at zero gap, 30/30 at 1 ms and 30/30 at 3 ms. The driver therefore
+inserts **1 ms after successful VOLT or CURR ACK before GETS**, and nowhere else.
+The parent subsequently completed a 300-frame exercise but observed a dropped
+GETS during CURR restoration, with output already OFF. Its
+`bk1697/libsigrok/hardware-current-timing-stress.log` reports 26/30 successes at
+zero gap and 30/30 at 1 ms. Its `hardware-off-timing-stress.log` reports
+SOUT001->GPAL succeeding 30/30 at both zero gap and 1 ms, so SOUT is not delayed.
+This is a narrowly scoped observed-firmware workaround, not a manufacturer
+timing specification or a guarantee for every unit. No retry, blanket command
+gap or open quarantine was restored.
+
+The parent also reports real SmuView startup improving from 7.6 s to 0.55 s,
+a nine-getter batch from 1232 ms to 0.14 ms, and capture from 5.2 to 25 Hz during
+the preceding simplifications. These are parent measurements, not new hardware
+or GUI tests performed here. Final controlled physical fault/OVP activation and
+UI presentation testing remain with the parent; offline tests prove decoding,
+cached getters, metadata activation/clear and callback ordering only.
 
 ## Historical voltage discrepancy
 
