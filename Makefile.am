@@ -254,6 +254,14 @@ src_libdrivers_la_SOURCES += \
 	src/hardware/beaglelogic/beaglelogic_native.c \
 	src/hardware/beaglelogic/beaglelogic_tcp.c
 endif
+if HW_BKPRECISION_1697
+src_libdrivers_la_SOURCES += \
+	src/hardware/bkprecision-1697/parse.h \
+	src/hardware/bkprecision-1697/parse.c \
+	src/hardware/bkprecision-1697/protocol.h \
+	src/hardware/bkprecision-1697/protocol.c \
+	src/hardware/bkprecision-1697/api.c
+endif
 if HW_BRYMEN_DMM
 src_libdrivers_la_SOURCES += \
 	src/hardware/brymen-dmm/parser.c \
@@ -694,9 +702,20 @@ EXTRA_DIST = \
 	contrib/61-libsigrok-plugdev.rules \
 	contrib/61-libsigrok-uaccess.rules
 
+# Pure protocol tests need only GLib, not the optional Check framework.
+TESTS = tests/check_bkprecision_1697
+check_PROGRAMS = tests/check_bkprecision_1697
+tests_check_bkprecision_1697_SOURCES = \
+	tests/check_bkprecision_1697.c \
+	src/hardware/bkprecision-1697/parse.c \
+	src/hardware/bkprecision-1697/parse.h
+tests_check_bkprecision_1697_LDADD = $(SR_EXTRA_LIBS)
+EXTRA_DIST += tests/bk1697_driver.c tests/bk1697-driver.sh tests/bk1697-driver.md \
+	src/hardware/bkprecision-1697/README.md
+
 if HAVE_CHECK
-TESTS = tests/main
-check_PROGRAMS = ${TESTS}
+TESTS += tests/main
+check_PROGRAMS += tests/main
 endif
 
 tests_main_SOURCES = \
