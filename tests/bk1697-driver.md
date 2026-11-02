@@ -7,7 +7,8 @@ supplies serial and session-source seam declarations only.
 
 ## Build and run
 
-Baseline: branch `arch-bkprecision-1697`, HEAD `1a8e652e`. The existing
+Current GOVP/SOVP baseline: branch `arch-bkprecision-1697`, HEAD `a46f4d8e`.
+The older simplification/timing evidence below predates this addition. The existing
 `build-performance` is frozen for parent measurements and was **not rebuilt or
 modified**. This work uses:
 
@@ -43,6 +44,94 @@ actual driver registration (key=device, fd=-1, events=0, timeout=10) and forward
 unchanged to the real session implementation. Dispatch verifies no readiness
 events. Source removal uses the same device key. No parser or driver source is
 compiled directly into the integration executable.
+
+## Native GOVP/SOVP verification (current)
+
+This exposes only standard `SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD`
+GET/SET/LIST, double volts. It is the **upper programming voltage ceiling**, not
+the fixed tracking OVP that trips at actual voltage about 10% above target.
+Existing GPAL OVP-active behavior is unchanged. No OVP-enable or regulation
+setter, custom memory/timer/key-lock keys, worker, quarantine or global delay
+was added. Scan/open now perform exactly five read-only probes.
+
+Bounds: threshold **1.0..GMAX voltage**, step **0.1 V**, including factory
+**40.2 V / 402** restoration. Target write/list maximum is
+**min(40 V, GMAX voltage, GOVP)**. Target writes refresh actual GOVP first;
+threshold writes refresh GETS and reject a new ceiling below the current target.
+Neither rejection changes the ceiling, target or output. SOVP ACK must be followed
+by actual GOVP readback. No requested value is fabricated into the cache.
+
+### Red/green evidence
+
+The parser and public driver serial seams were exercised before implementation.
+All four RED commands below exited 134 from assertions, not watchdog expiry:
+
+| Test | RED | GREEN |
+| --- | --- | --- |
+| `/bk1697/upper-voltage` | typed three-digit reply rejected at a partial boundary | all split boundaries, 1.0/40.2 V and malformed width/digit/ACK/trailer pass |
+| `/bk1697/upper-voltage-getter` | public GET returned SR_ERR_ARG | probe seed, independent 250 ms GOVP TTL, shared target LIST and capability scope pass |
+| `/bk1697/upper-voltage-setting` | SET returned SR_ERR_NA | limits, smaller GMAX, ignored ACK, actual readback, bidirectional guards and 402 restore pass |
+| `/bk1697/upper-voltage-poll/change` | zero of two expected metadata stages | two actual front-panel values and cached callback getters pass |
+
+Evidence: `build-simplified/govp-{parser,getter,setting,meta}-red.log`.
+Getter and setting focused GREEN logs are `govp-{getter,setting}-green.log`;
+`govp-driver-tests.log` and `tests/check_bkprecision_1697.log` contain final GREEN
+for all cases. To reproduce RED, run against the corresponding preceding
+implementation (the completed driver correctly passes these tests).
+
+Commands from the repository root:
+
+```sh
+cc -std=c99 -Wall -Wextra -Werror -Iinclude $(pkg-config --cflags glib-2.0) \
+  tests/check_bkprecision_1697.c src/hardware/bkprecision-1697/parse.c \
+  $(pkg-config --libs glib-2.0) -lm -o build-simplified/bk1697-parser
+build-simplified/bk1697-parser -p /bk1697/upper-voltage
+make -C build-simplified -j4
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-setting
+# The same hook runs focused getter or upper-voltage-poll/change tests.
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 120 sh tests/bk1697-driver.sh
+LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+  make -C build-simplified check -j4
+git diff --check
+```
+
+Final verification: **43/43 integration cases** (all prior 34 plus nine),
+**6/6 pure parser/setting cases**, **76/76 upstream Check checks**, zero
+failures/errors; `git diff --check` passes. The ready build is
+`/home/mendel/Documents/Projects/drivers/libsigrok-arch/build-simplified`,
+including `.libs/libsigrok.so` and `.libs/libsigrok.a`.
+No changes were made to `build-performance`, packages or hardware.
+
+Additional coverage includes mandatory GOVP readback failure while idle and
+active (fault latch, immediate END, no fabricated threshold); invalid late GOVP
+probe bounds; front-panel metadata callback stop/close ordering; and cached
+getters with the wire held by GETD, VOLT ACK or SOVP ACK. The setter-ACK hold is
+explicitly command-gated so the new prequeries cannot accidentally substitute
+a held GOVP/GETS reply for the original ACK-contention test.
+
+A verification run measured held-wire getters at **0.027 ms**, held VOLT-ACK getters
+at **0.051 ms**, and held SOVP-ACK getters at **0.038 ms**, all with **zero extra
+commands**, retaining the <50 ms assertions. The command sequence now has 14
+rather than 12 writes/readbacks because each VOLT is preceded by GOVP. The
+original <80 ms total/max-gap bounds and VOLT/CURR >=1 ms minima are unchanged.
+Measured minima were **1.053/1.023 ms**; ten other gaps totaled **0.027 ms**
+(<5 ms, still rejects blanket 1 ms spacing). A separate exact 24-command
+GETS/SOVP/GOVP sequence totaled **0.022 ms** in gaps (<5 ms), rejecting even a
+SOVP-only 1 ms wait.
+
+### Remaining risks
+
+SOVP post-ACK settling has **not** been measured physically. There is deliberately
+**no SOVP delay** pending parent direct 0 vs 1 ms measurements; only the existing
+measured VOLT/CURR 1 ms waits remain. A dropped GOVP reply faults rather than
+retrying SOVP. Front-panel changes between a safety prequery and the write cannot
+be atomic. Active snapshots can lag until the normal >=500 ms status refresh;
+idle TTL stays 250 ms. Physical tracking-trip behavior, electrical accuracy,
+loaded CC scaling and GUI behavior remain parent-owned verification.
+
+Review was performed locally against the working-tree diff from `a46f4d8e`,
+using `HACKING` and the supplied spec; no agents or commits were used.
 
 ## Test-first evidence
 
@@ -116,7 +205,7 @@ Evidence logs: `build-simplified/voltage-delay-{red,green}.log`,
 For the parser case, build `tests/check_bkprecision_1697` then run it with
 `-p /bk1697/panel-ovp`; integration cases use the existing shell hook and `-p`.
 
-## Final verification
+## Prior verification (before GOVP/SOVP)
 
 Final rerun after scoped VOLT/CURR timing and cached/metadata OVP support:
 
@@ -146,7 +235,7 @@ the instantaneous model. Fault cases explicitly expire caches when transport
 injection requires it, and preserve timeout, short/failed write, malformed reply,
 CRLF, overlong frame, panel indicators, pending input and read-error checks.
 
-Explicit close/reopen flushes staged stale bytes and executes GMAX/GETS/GETD/GPAL
+Explicit close/reopen flushes staged stale bytes and executes GMAX/GETS/GETD/GPAL/GOVP
 only. No timed quarantine or automatic retry/replay of ambiguous writes is
 required. Programming bounds/headroom, smaller GMAX, both GETD formats,
 precision/units/regulation, time/sample limits, wire exclusion under a held
@@ -157,7 +246,7 @@ write. No existing wire-completion or no-interleaving assertions were removed.
 ## Design and scope
 
 The transport query handles framing and bounded I/O only. A narrow typed group
-table/helper selects GETD/GETS/GPAL, validates envelopes and publishes snapshots
+table/helper selects GETD/GETS/GPAL/GOVP, validates envelopes and publishes snapshots
 for idle misses, probe, acquisition and setter readback. No reverse command-name
 comparison is needed. `cache_ready` gates all groups after a complete successful
 probe; per-snapshot valid flags are redundant and removed. Boolean response

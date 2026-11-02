@@ -19,6 +19,7 @@ static const struct {
 	{ "GETD00", BK1697_MEASUREMENT },
 	{ "GETS00", BK1697_VALUES },
 	{ "GPAL00", BK1697_PANEL },
+	{ "GOVP00", BK1697_UPPER_VOLTAGE },
 };
 
 /* Called under the wire mutex. Invalidate all groups as one short operation. */
@@ -137,6 +138,9 @@ SR_PRIV int bk1697_query_group(const struct sr_dev_inst *sdi,
 		(response->voltage < 1.0 || response->voltage > devc->maximum.voltage ||
 		 response->current < 0.01 || response->current > devc->maximum.current))
 		return fault(devc);
+	if (group == BK1697_GOVP &&
+		(response->voltage < 1.0 || response->voltage > devc->maximum.voltage))
+		return fault(devc);
 	if (group == BK1697_GETD &&
 		(response->voltage > 40.2 || response->current > 5.02))
 		return fault(devc);
@@ -170,6 +174,9 @@ SR_PRIV int bk1697_probe(const struct sr_dev_inst *sdi)
 	if (ret != SR_OK)
 		return ret;
 	ret = bk1697_query_group(sdi, BK1697_GPAL, &r);
+	if (ret != SR_OK)
+		return ret;
+	ret = bk1697_query_group(sdi, BK1697_GOVP, &r);
 	if (ret == SR_OK) {
 		g_mutex_lock(&devc->cache_mutex);
 		devc->cache_ready = TRUE;
@@ -286,9 +293,9 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	g_mutex_lock(&devc->cache_mutex);
 	stop = sr_sw_limits_check(&devc->limits);
 	group = BK1697_GETD;
-	/* Measurement slots alternate with fair, age-gated status slots. */
-	if (devc->refresh_group == 1 || devc->refresh_group == 3) {
-		group = devc->refresh_group == 1 ? BK1697_GETS : BK1697_GPAL;
+	/* Alternate measurement with age-gated GETS, GPAL, GOVP slots. */
+	if (devc->refresh_group % 2) {
+		group = BK1697_GETS + devc->refresh_group / 2;
 		updated = devc->cache[group].updated;
 		if (g_get_monotonic_time() - updated < STATUS_REFRESH_US)
 			group = BK1697_GETD;
@@ -297,7 +304,7 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	/* No inter-command delay: physical reads remain synchronous and retain
 	 * the complete-reply framing and bounded deadline guarantees. */
 	ret = stop ? SR_ERR : bk1697_query_group(sdi, group, &r);
-	devc->refresh_group = (devc->refresh_group + 1) % 4;
+	devc->refresh_group = (devc->refresh_group + 1) % 6;
 	end = FALSE;
 	if (ret != SR_OK)
 		bk1697_stop_locked(sdi, &end);
@@ -306,6 +313,14 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 		bk1697_send_end(sdi);
 	if (ret != SR_OK)
 		return TRUE;
+	if (group == BK1697_GOVP) {
+		if (bk1697_send_begin(sdi, generation)) {
+			sr_session_send_meta(sdi, SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+				g_variant_new_double(r.voltage));
+			bk1697_send_done(sdi);
+		}
+		return TRUE;
+	}
 	if (group == BK1697_GPAL) {
 		/* Like RDTech, report protection state as metadata. Reserve the
 		 * packet so a reentrant stop/close still delivers END afterward. */

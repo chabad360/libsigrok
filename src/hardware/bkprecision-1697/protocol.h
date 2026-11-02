@@ -13,7 +13,7 @@
 
 #define LOG_PREFIX "bkprecision-1697"
 
-enum bk1697_group { BK1697_GETD, BK1697_GETS, BK1697_GPAL, BK1697_GROUPS };
+enum bk1697_group { BK1697_GETD, BK1697_GETS, BK1697_GPAL, BK1697_GOVP, BK1697_GROUPS };
 
 struct bk1697_snapshot {
 	struct bk1697_response response;

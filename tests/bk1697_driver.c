@@ -24,14 +24,14 @@ static struct {
 	GPtrArray *commands;
 	GString *rx;
 	gboolean opened, wide, output_data, enabled;
-	gboolean ignore_setting, fail_readback, bad_measurement, bad_panel, over_voltage;
-	gboolean hold, entered, contender, release, configured;
+	gboolean ignore_setting, fail_readback, fail_upper_readback, bad_measurement, bad_panel, over_voltage;
+	gboolean hold, hold_setting, entered, contender, release, configured;
 	unsigned int opens, closes, flushes, adds, removes, prereads;
 	unsigned int serial_sources, timer_calls;
 	sr_receive_data_callback timer_cb;
 	void *timer_data;
-	unsigned int headers, ends, frames, frame_ends, analogs, metas, ovp_metas;
-	unsigned int voltage_count, current_count;
+	unsigned int headers, ends, frames, frame_ends, analogs, metas, ovp_metas, upper_metas;
+	unsigned int voltage_count, current_count, upper_voltage_count;
 	double voltage, current;
 	char maximum[7];
 	enum injection inject;
@@ -49,7 +49,7 @@ static gboolean reentrant, stream_ended, close_packet, repeat_stop, live_status;
 static gboolean observer_ended, setter_fault, setter_fault_readback;
 static unsigned int observer_ends;
 static int stop_packet;
-static unsigned int ovp_mode, ovp_stage;
+static unsigned int ovp_mode, ovp_stage, upper_mode, upper_stage;
 
 int __wrap_serial_open(struct sr_serial_dev_inst *serial, int flags)
 {
@@ -159,7 +159,11 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 	}
 	if (!strcmp(command, "GMAX00"))
 		g_string_printf(wire.rx, "%s\rOK\r", wire.maximum);
-	else if (!strcmp(command, "GETS00")) {
+	else if (!strcmp(command, "GOVP00")) {
+		g_string_printf(wire.rx, "%03u\rOK\r", wire.upper_voltage_count);
+		if (wire.fail_upper_readback)
+			wire.inject = READ_ERROR;
+	} else if (!strcmp(command, "GETS00")) {
 		gint64 now = g_get_monotonic_time();
 		if (wire.last_gets)
 			wire.gets_gap = MAX(wire.gets_gap, now - wire.last_gets);
@@ -182,6 +186,11 @@ int __wrap_serial_write_blocking(struct sr_serial_dev_inst *serial,
 		memcpy(panel + 65, wire.bad_panel ? "00" : wire.enabled ? "01" : "10", 2);
 		memcpy(panel + 68, "\rOK\r", 5);
 		g_string_assign(wire.rx, panel);
+	} else if (g_str_has_prefix(command, "SOVP00")) {
+		g_assert_cmpuint(strlen(command), ==, 9);
+		if (!wire.ignore_setting)
+			wire.upper_voltage_count = g_ascii_strtoull(command + 6, NULL, 10);
+		g_string_assign(wire.rx, "OK\r");
 	} else if (g_str_has_prefix(command, "VOLT00")) {
 		g_assert_cmpuint(strlen(command), ==, 9);
 		if (!wire.ignore_setting)
@@ -209,7 +218,9 @@ int __wrap_serial_read_blocking(struct sr_serial_dev_inst *serial, void *buf,
 	g_assert_cmpuint(timeout_ms, >, 0);
 	g_assert_cmpuint(timeout_ms, <=, 500);
 	g_mutex_lock(&wire.lock);
-	if (wire.hold) {
+	if (wire.hold && (!wire.hold_setting ||
+		g_str_has_prefix(g_ptr_array_index(wire.commands, wire.commands->len - 1), "VOLT00") ||
+		g_str_has_prefix(g_ptr_array_index(wire.commands, wire.commands->len - 1), "SOVP00"))) {
 		wire.entered = TRUE;
 		g_cond_broadcast(&wire.cond);
 		while (!wire.release)
@@ -331,7 +342,7 @@ static GSList *scan(const char *conn)
 
 static void probe_at(unsigned int at)
 {
-	static const char *expected[] = { "GMAX00", "GETS00", "GETD00", "GPAL00" };
+	static const char *expected[] = { "GMAX00", "GETS00", "GETD00", "GPAL00", "GOVP00" };
 	unsigned int i;
 	for (i = 0; i < G_N_ELEMENTS(expected); i++)
 		g_assert_cmpstr(g_ptr_array_index(wire.commands, at + i), ==, expected[i]);
@@ -347,6 +358,7 @@ static void setup(void)
 	g_cond_init(&wire.cond);
 	wire.commands = g_ptr_array_new_with_free_func(g_free);
 	wire.rx = g_string_new(NULL);
+	wire.upper_voltage_count = 402;
 	wire.voltage_count = 120;
 	wire.current_count = 50;
 	memcpy(wire.maximum, "402502", 7);
@@ -365,15 +377,15 @@ static void setup(void)
 	g_assert_cmpuint(g_slist_length(devices), ==, 1);
 	device = devices->data;
 	g_slist_free(devices);
-	g_assert_cmpuint(wire.commands->len, ==, 4);
+	g_assert_cmpuint(wire.commands->len, ==, 5);
 	probe_at(0);
 	g_assert_cmpuint(wire.closes, ==, 1);
 	g_assert(!(wire.opened));
 	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
-	g_assert_cmpuint(wire.commands->len, ==, 8);
-	probe_at(4);
+	g_assert_cmpuint(wire.commands->len, ==, 10);
+	probe_at(5);
 	g_assert_cmpint(sr_dev_open(device), ==, SR_ERR);
-	g_assert_cmpuint(wire.commands->len, ==, 8);
+	g_assert_cmpuint(wire.commands->len, ==, 10);
 	session = NULL;
 	reentrant = FALSE;
 	live_status = FALSE;
@@ -385,7 +397,7 @@ static void setup(void)
 	setter_fault_readback = FALSE;
 	observer_ends = 0;
 	stop_packet = -1;
-	ovp_mode = ovp_stage = 0;
+	ovp_mode = ovp_stage = upper_mode = upper_stage = 0;
 }
 
 static void teardown(void)
@@ -468,7 +480,7 @@ static void reconnect(void)
 	/* A late ACK must be flushed, not accepted by the next transaction. */
 	g_string_assign(wire.rx, "OK\r");
 	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
-	g_assert_cmpuint(wire.commands->len, ==, count + 4);
+	g_assert_cmpuint(wire.commands->len, ==, count + 5);
 	probe_at(count);
 	g_assert_cmpuint(wire.rx->len, ==, 0);
 }
@@ -483,6 +495,9 @@ static void assert_latched(void)
 	g_assert((value) == NULL);
 	g_assert_cmpint(sr_config_get(driver, device, NULL,
 		SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE, &value), !=, SR_OK);
+	g_assert(value == NULL);
+	g_assert_cmpint(sr_config_get(driver, device, NULL,
+		SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, &value), !=, SR_OK);
 	g_assert(value == NULL);
 	g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
 	g_assert_cmpuint(wire.commands->len, ==, count);
@@ -574,6 +589,8 @@ static void test_revalidation(void)
 	teardown();
 }
 
+static void check_range(uint32_t key, double maximum);
+
 static void feed(const struct sr_dev_inst *sdi,
 	const struct sr_datafeed_packet *packet, void *data)
 {
@@ -582,6 +599,7 @@ static void feed(const struct sr_dev_inst *sdi,
 	const struct sr_config *config;
 	GVariant *value;
 	float sample;
+	unsigned int count;
 	(void)sdi;
 	(void)data;
 	if (packet->type == SR_DF_HEADER)
@@ -627,6 +645,22 @@ static void feed(const struct sr_dev_inst *sdi,
 					g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
 				else if (ovp_mode == 2 || ovp_stage == 2)
 					g_assert_cmpint(sr_session_stop(session), ==, SR_OK);
+			}
+		} else if (config->key == SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD) {
+			count = wire.commands->len;
+			wire.upper_metas++;
+			g_assert_cmpfloat(g_variant_get_double(config->data), ==, wire.upper_voltage_count / 10.0);
+			check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, wire.upper_voltage_count / 10.0);
+			check_range(SR_CONF_VOLTAGE_TARGET, MIN(40.0, wire.upper_voltage_count / 10.0));
+			g_assert_cmpuint(wire.commands->len, ==, count);
+			if (upper_mode) {
+				upper_stage++;
+				if (upper_mode == 3)
+					g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
+				else if (upper_mode == 2 || upper_stage == 2)
+					g_assert_cmpint(sr_session_stop(session), ==, SR_OK);
+				else
+					wire.upper_voltage_count = 170;
 			}
 		} else {
 			wire.metas++;
@@ -755,7 +789,7 @@ static void test_callback_stop(gconstpointer data)
 	if (close_packet) {
 		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
 		probe_at(count);
-		g_assert_cmpuint(wire.commands->len, ==, count + 4);
+		g_assert_cmpuint(wire.commands->len, ==, count + 5);
 	}
 	teardown();
 }
@@ -929,7 +963,13 @@ static void test_smaller_maximum(void)
 	unsigned int count;
 	setup();
 	memcpy(wire.maximum, "200200", 7);
+	wire.upper_voltage_count = 200;
 	reconnect();
+	check_range(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 20.0);
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(20.1)), ==, SR_ERR_ARG);
+	g_assert_cmpuint(wire.commands->len, ==, count);
 	g_assert_cmpint(sr_config_list(driver, device, NULL, SR_CONF_VOLTAGE_TARGET, &value), ==, SR_OK);
 	g_assert_cmpuint(g_variant_n_children(value), ==, 3);
 	g_variant_get_child(value, 0, "d", &low);
@@ -961,6 +1001,7 @@ static gpointer snapshot_getter(gpointer unused)
 	static const uint32_t keys[] = { SR_CONF_VOLTAGE, SR_CONF_CURRENT,
 		SR_CONF_REGULATION, SR_CONF_VOLTAGE_TARGET, SR_CONF_CURRENT_LIMIT,
 		SR_CONF_ENABLED, SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE,
+		SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
 		SR_CONF_CONN, SR_CONF_LIMIT_SAMPLES };
 	GVariant *value;
 	gint64 start;
@@ -976,6 +1017,8 @@ static gpointer snapshot_getter(gpointer unused)
 		value = get(keys[i]);
 		if (keys[i] == SR_CONF_VOLTAGE_TARGET)
 			g_assert_cmpfloat(g_variant_get_double(value), ==, 12.0);
+		if (keys[i] == SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD)
+			g_assert_cmpfloat(g_variant_get_double(value), ==, 40.2);
 		g_variant_unref(value);
 	}
 	g_assert_cmpint(sr_config_list(driver, device, NULL, SR_CONF_VOLTAGE_TARGET, &value), ==, SR_OK);
@@ -1025,14 +1068,14 @@ static void test_snapshot_latency(void)
 	teardown();
 }
 
-static gpointer snapshot_setter(gpointer unused)
+static gpointer snapshot_setter(gpointer data)
 {
-	(void)unused;
-	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
+	g_assert_cmpint(set(GPOINTER_TO_INT(data) ? SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD :
+		SR_CONF_VOLTAGE_TARGET, g_variant_new_double(GPOINTER_TO_INT(data) ? 16 : 13)), ==, SR_OK);
 	return NULL;
 }
 
-static void test_active_setter_snapshot(void)
+static void test_active_setter_snapshot(gconstpointer data)
 {
 	GThread *setter, *getter, *watchdog;
 	setup();
@@ -1041,7 +1084,8 @@ static void test_active_setter_snapshot(void)
 	/* Hold the setter ACK, not an acquisition reply. The previous actual
 	 * GETS must remain available without borrowing the setter's wire lock. */
 	wire.hold = TRUE;
-	setter = g_thread_new("setter", snapshot_setter, NULL);
+	wire.hold_setting = TRUE;
+	setter = g_thread_new("setter", snapshot_setter, (gpointer)data);
 	getter = g_thread_new("snapshot", snapshot_getter, NULL);
 	watchdog = g_thread_new("watchdog", snapshot_watchdog, NULL);
 	g_thread_join(getter);
@@ -1051,7 +1095,8 @@ static void test_active_setter_snapshot(void)
 		getter_elapsed / 1000.0, getter_commands);
 	g_assert_cmpint(getter_elapsed, <, 50000);
 	g_assert_cmpuint(getter_commands, ==, 0);
-	check_double(SR_CONF_VOLTAGE_TARGET, 13);
+	check_double(SR_CONF_VOLTAGE_TARGET, GPOINTER_TO_INT(data) ? 12 : 13);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, GPOINTER_TO_INT(data) ? 16 : 40.2);
 	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
 	teardown();
 }
@@ -1117,8 +1162,8 @@ static void test_actual_readback(void)
 	wire.ignore_setting = TRUE;
 	count = wire.commands->len;
 	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), ==, SR_OK);
-	g_assert_cmpuint(wire.commands->len, ==, count + 2);
-	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GETS00");
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GETS00");
 	check_double(SR_CONF_VOLTAGE_TARGET, 12);
 	count = wire.commands->len;
 	g_assert_cmpint(set(SR_CONF_CURRENT_LIMIT, g_variant_new_double(1)), ==, SR_OK);
@@ -1136,8 +1181,8 @@ static void test_actual_readback(void)
 	count = wire.commands->len;
 	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(13)), !=, SR_OK);
 	/* The write ACK must succeed; inject failure in its actual GETS reply. */
-	g_assert_cmpuint(wire.commands->len, ==, count + 2);
-	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "GETS00");
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GETS00");
 	assert_latched();
 	wire.fail_readback = FALSE;
 	reconnect();
@@ -1147,7 +1192,7 @@ static void test_actual_readback(void)
 
 static void test_live_status(void)
 {
-	unsigned int start, i, measurements = 0, settings = 0, panels = 0;
+	unsigned int start, i, measurements = 0, settings = 0, panels = 0, ceilings = 0;
 	const char *command;
 	setup();
 	wire.voltage_count = 135;
@@ -1170,6 +1215,8 @@ static void test_live_status(void)
 			settings++;
 		else if (!strcmp(command, "GPAL00"))
 			panels++;
+		else if (!strcmp(command, "GOVP00"))
+			ceilings++;
 		else
 			g_assert_not_reached();
 	}
@@ -1177,6 +1224,7 @@ static void test_live_status(void)
 	g_assert_cmpuint(wire.frames, ==, 120);
 	g_assert_cmpuint(settings, >=, 2);
 	g_assert_cmpuint(panels, >=, 2);
+	g_assert_cmpuint(ceilings, >=, 2);
 	/* Include the final partial interval, with timer/scheduler slack. */
 	g_assert_cmpint(MAX(wire.gets_gap, g_get_monotonic_time() - wire.last_gets), <, 1100000);
 	g_assert_cmpint(MAX(wire.gpal_gap, g_get_monotonic_time() - wire.last_gpal), <, 1100000);
@@ -1188,8 +1236,8 @@ static void test_live_status(void)
 static void test_no_command_spacing(void)
 {
 	static const char *expected[] = {
-		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00",
-		"VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT001", "GPAL00"
+		"GOVP00", "VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT000", "GPAL00",
+		"GOVP00", "VOLT00130", "GETS00", "CURR00070", "GETS00", "SOUT001", "GPAL00"
 	};
 	unsigned int start, i;
 	gint64 began, elapsed;
@@ -1212,12 +1260,181 @@ static void test_no_command_spacing(void)
 	for (i = 0; i < G_N_ELEMENTS(expected); i++)
 		g_assert_cmpstr(g_ptr_array_index(wire.commands, start + i), ==, expected[i]);
 	g_assert_cmpuint(wire.rx->len, ==, 0);
-	g_test_message("12 uncached commands: %.3f ms total, %.3f ms maximum reply-to-command gap",
+	g_test_message("14 uncached commands: %.3f ms total, %.3f ms maximum reply-to-command gap",
 		elapsed / 1000.0, wire.max_command_gap / 1000.0);
 	g_assert_cmpint(wire.max_command_gap, <, 80000);
 	g_assert_cmpint(elapsed, <, 80000);
 	check_double(SR_CONF_VOLTAGE_TARGET, 13);
 	check_double(SR_CONF_CURRENT_LIMIT, 0.7);
+	teardown();
+}
+
+static void check_range(uint32_t key, double maximum)
+{
+	GVariant *value;
+	double low, high, step;
+	g_assert_cmpint(sr_config_list(driver, device, NULL, key, &value), ==, SR_OK);
+	g_variant_get_child(value, 0, "d", &low);
+	g_variant_get_child(value, 1, "d", &high);
+	g_variant_get_child(value, 2, "d", &step);
+	g_assert_cmpfloat(low, ==, 1.0);
+	g_assert_cmpfloat(high, ==, maximum);
+	g_assert_cmpfloat(step, ==, 0.1);
+	g_variant_unref(value);
+}
+
+static void test_upper_voltage_setting(void)
+{
+	static const double bad[] = { 0, 0.9, 40.3, 12.34, NAN, INFINITY, -INFINITY };
+	unsigned int i, count;
+	setup();
+	count = wire.commands->len;
+	for (i = 0; i < G_N_ELEMENTS(bad); i++)
+		g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+			g_variant_new_double(bad[i])), ==, SR_ERR_ARG);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	check_range(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 40.2);
+	check_range(SR_CONF_VOLTAGE_TARGET, 40.0);
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(15.0)), ==, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "SOVP00150");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GOVP00");
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
+	check_range(SR_CONF_VOLTAGE_TARGET, 15.0);
+	/* Neither ACK nor the requested value may fabricate the actual ceiling. */
+	wire.ignore_setting = TRUE;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(16.0)), ==, SR_OK);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
+	wire.ignore_setting = FALSE;
+	/* Front-panel changes must be queried even while GOVP is cache-fresh. */
+	wire.upper_voltage_count = 140;
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(14.1)), ==, SR_ERR_ARG);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GOVP00");
+	check_range(SR_CONF_VOLTAGE_TARGET, 14.0);
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(14.0)), ==, SR_OK);
+	/* Fresh GETS protects a target changed outside the driver's cache. */
+	wire.voltage_count = 145;
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(14.4)), ==, SR_ERR_ARG);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	g_assert_cmpuint(wire.voltage_count, ==, 145);
+	g_assert(!wire.enabled);
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(40.2)), ==, SR_OK);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 40.2);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, wire.commands->len - 2), ==, "SOVP00402");
+	/* The documented lower endpoint is usable once the target is safe. */
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(1.0)), ==, SR_OK);
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(1.0)), ==, SR_OK);
+	check_range(SR_CONF_VOLTAGE_TARGET, 1.0);
+	teardown();
+}
+
+static void test_upper_voltage_poll(gconstpointer data)
+{
+	unsigned int count;
+	setup();
+	new_session(0, 1800);
+	upper_mode = GPOINTER_TO_UINT(data);
+	wire.upper_voltage_count = 160;
+	g_assert_cmpint(sr_session_datafeed_callback_add(session, observe_order, NULL), ==, SR_OK);
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(upper_stage, ==, upper_mode == 1 ? 2 : 1);
+	g_assert_cmpuint(wire.upper_metas, ==, upper_stage);
+	g_assert_cmpuint(wire.ends, ==, 1);
+	g_assert_cmpuint(observer_ends, ==, 1);
+	g_assert_cmpuint(wire.frames, ==, wire.frame_ends);
+	g_assert_cmpuint(wire.metas, ==, wire.frames);
+	g_assert_cmpuint(wire.adds, ==, wire.removes);
+	if (upper_mode == 3) {
+		count = wire.commands->len;
+		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
+		probe_at(count);
+		g_assert_cmpuint(wire.commands->len, ==, count + 5);
+	}
+	teardown();
+}
+
+static void test_upper_voltage_readback_fault(gconstpointer data)
+{
+	unsigned int count;
+	setup();
+	if (GPOINTER_TO_INT(data)) {
+		new_session(1, 0);
+		g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	}
+	wire.fail_upper_readback = TRUE;
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(16.0)), !=, SR_OK);
+	g_assert_cmpuint(wire.commands->len, ==, count + 3);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 1), ==, "SOVP00160");
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count + 2), ==, "GOVP00");
+	assert_latched();
+	if (session) {
+		g_assert_cmpuint(wire.ends, ==, 1);
+		g_assert_cmpuint(wire.removes, ==, 1);
+		g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+		g_assert_cmpuint(wire.frames, ==, 0);
+	}
+	wire.fail_upper_readback = FALSE;
+	reconnect();
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 16.0);
+	teardown();
+}
+
+static void test_upper_voltage_no_delay(void)
+{
+	unsigned int i, count;
+	setup();
+	count = wire.commands->len;
+	wire.measure_gaps = TRUE;
+	for (i = 0; i < 8; i++) {
+		g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+			g_variant_new_double(i % 2 ? 40.2 : 16.0)), ==, SR_OK);
+		g_assert_cmpstr(g_ptr_array_index(wire.commands, count + i * 3), ==, "GETS00");
+		g_assert_cmpstr(g_ptr_array_index(wire.commands, count + i * 3 + 1), ==,
+			i % 2 ? "SOVP00402" : "SOVP00160");
+		g_assert_cmpstr(g_ptr_array_index(wire.commands, count + i * 3 + 2), ==, "GOVP00");
+	}
+	wire.measure_gaps = FALSE;
+	g_assert_cmpuint(wire.commands->len, ==, count + 24);
+	g_test_message("24 GETS/SOVP/GOVP command gaps total %.3f ms", wire.other_gap_total / 1000.0);
+	/* Also rejects a SOVP-only 1 ms settling wait, not just a global gap. */
+	g_assert_cmpint(wire.other_gap_total, <, 5000);
+	teardown();
+}
+
+static void test_upper_voltage_getter(void)
+{
+	unsigned int count;
+	setup();
+	count = wire.commands->len;
+	g_assert(sr_dev_has_option(device, SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD));
+	g_assert(!sr_dev_has_option(device, SR_CONF_OVER_VOLTAGE_PROTECTION_ENABLED));
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_ENABLED, g_variant_new_boolean(TRUE)), !=, SR_OK);
+	g_assert_cmpint(set(SR_CONF_REGULATION, g_variant_new_string("CV")), !=, SR_OK);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 40.2);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	wire.upper_voltage_count = 150;
+	/* Reuse the actual probe snapshot until this group expires. */
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 40.2);
+	g_usleep(260000);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
+	check_range(SR_CONF_VOLTAGE_TARGET, 15.0);
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 15.0);
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GOVP00");
 	teardown();
 }
 
@@ -1279,9 +1496,9 @@ static void test_ovp_poll(gconstpointer data)
 
 static void test_setting_readback_delay(void)
 {
-	/* Same 12 actual commands as the no-global-spacing regression. */
+	/* Same 14 actual commands as the no-global-spacing regression. */
 	test_no_command_spacing();
-	g_test_message("VOLT->GETS minimum %.3f ms; CURR->GETS minimum %.3f ms; eight other gaps total %.3f ms",
+	g_test_message("VOLT->GETS minimum %.3f ms; CURR->GETS minimum %.3f ms; ten other gaps total %.3f ms",
 		wire.voltage_readback_min / 1000.0, wire.current_readback_min / 1000.0,
 		wire.other_gap_total / 1000.0);
 	g_assert_cmpuint(wire.voltage_readbacks, ==, 2);
@@ -1415,22 +1632,24 @@ static void test_late_probe_validation(void)
 	GVariant *value;
 	unsigned int i, count;
 	setup();
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < 4; i++) {
 		g_assert_cmpint(sr_dev_close(device), ==, SR_OK);
 		wire.bad_measurement = i == 0;
 		wire.bad_panel = i == 1;
+		wire.upper_voltage_count = i == 2 ? 403 : i == 3 ? 9 : 402;
 		count = wire.commands->len;
 		g_assert_cmpint(sr_dev_open(device), !=, SR_OK);
 		g_assert(!wire.opened);
-		g_assert_cmpuint(wire.commands->len, ==, count + (i ? 4 : 3));
+		g_assert_cmpuint(wire.commands->len, ==, count + (i >= 2 ? 5 : i ? 4 : 3));
 		count = wire.commands->len;
 		value = NULL;
 		g_assert_cmpint(sr_config_get(driver, device, NULL, SR_CONF_VOLTAGE_TARGET, &value), !=, SR_OK);
 		g_assert(value == NULL);
 		g_assert_cmpuint(wire.commands->len, ==, count);
 		wire.bad_measurement = wire.bad_panel = FALSE;
+		wire.upper_voltage_count = 402;
 		g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
-		g_assert_cmpuint(wire.commands->len, ==, count + 4);
+		g_assert_cmpuint(wire.commands->len, ==, count + 5);
 		probe_at(count);
 		check_double(SR_CONF_VOLTAGE_TARGET, 12);
 	}
@@ -1451,7 +1670,7 @@ static void test_open_without_delay(void)
 	g_assert_cmpint(sr_dev_open(device), ==, SR_OK);
 	elapsed = g_get_monotonic_time() - start;
 	g_assert_cmpuint(wire.flushes, ==, flushes + 1);
-	g_assert_cmpuint(wire.commands->len, ==, count + 4);
+	g_assert_cmpuint(wire.commands->len, ==, count + 5);
 	probe_at(count);
 	g_assert_cmpuint(wire.rx->len, ==, 0);
 	g_test_message("open/flush/probe: %.3f ms", elapsed / 1000.0);
@@ -1466,6 +1685,14 @@ int main(int argc, char **argv)
 	g_test_add_data_func("/bk1697/ovp-poll/activate-clear", GUINT_TO_POINTER(1), test_ovp_poll);
 	g_test_add_data_func("/bk1697/ovp-poll/callback-stop", GUINT_TO_POINTER(2), test_ovp_poll);
 	g_test_add_data_func("/bk1697/ovp-poll/callback-close", GUINT_TO_POINTER(3), test_ovp_poll);
+	g_test_add_data_func("/bk1697/upper-voltage-poll/change", GUINT_TO_POINTER(1), test_upper_voltage_poll);
+	g_test_add_data_func("/bk1697/upper-voltage-poll/callback-stop", GUINT_TO_POINTER(2), test_upper_voltage_poll);
+	g_test_add_data_func("/bk1697/upper-voltage-poll/callback-close", GUINT_TO_POINTER(3), test_upper_voltage_poll);
+	g_test_add_data_func("/bk1697/upper-voltage-readback-fault/idle", GINT_TO_POINTER(0), test_upper_voltage_readback_fault);
+	g_test_add_data_func("/bk1697/upper-voltage-readback-fault/active", GINT_TO_POINTER(1), test_upper_voltage_readback_fault);
+	g_test_add_func("/bk1697/upper-voltage-no-delay", test_upper_voltage_no_delay);
+	g_test_add_func("/bk1697/upper-voltage-setting", test_upper_voltage_setting);
+	g_test_add_func("/bk1697/upper-voltage-getter", test_upper_voltage_getter);
 	g_test_add_func("/bk1697/ovp-getter", test_ovp_getter);
 	g_test_add_func("/bk1697/setting-readback-delay", test_setting_readback_delay);
 	g_test_add_func("/bk1697/late-probe-validation", test_late_probe_validation);
@@ -1476,7 +1703,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/bk1697/held-wire-limits", test_held_wire_limits);
 	g_test_add_func("/bk1697/open-without-delay", test_open_without_delay);
 	g_test_add_func("/bk1697/no-command-spacing", test_no_command_spacing);
-	g_test_add_func("/bk1697/active-setter-snapshot", test_active_setter_snapshot);
+	g_test_add_data_func("/bk1697/active-setter-snapshot", GINT_TO_POINTER(0), test_active_setter_snapshot);
+	g_test_add_data_func("/bk1697/active-threshold-snapshot", GINT_TO_POINTER(1), test_active_setter_snapshot);
 	g_test_add_func("/bk1697/idle-groups", test_idle_groups);
 	g_test_add_func("/bk1697/actual-readback", test_actual_readback);
 	g_test_add_func("/bk1697/live-status", test_live_status);

@@ -17,6 +17,7 @@ enum bk1697_reply {
 	BK1697_MEASUREMENT,
 	BK1697_PANEL,
 	BK1697_OUTPUT,
+	BK1697_UPPER_VOLTAGE,
 };
 
 struct bk1697_response {

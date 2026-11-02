@@ -28,6 +28,7 @@ static const uint32_t devopts[] = {
 	SR_CONF_ENABLED | SR_CONF_GET | SR_CONF_SET,
 	SR_CONF_REGULATION | SR_CONF_GET,
 	SR_CONF_OVER_VOLTAGE_PROTECTION_ACTIVE | SR_CONF_GET,
+	SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD | SR_CONF_GET | SR_CONF_SET | SR_CONF_LIST,
 };
 
 static void clear_private(void *priv)
@@ -117,7 +118,7 @@ static GSList *scan(struct sr_dev_driver *di, GSList *options)
 	}
 	/* The protocol has no model ID. Never enumerate/probe arbitrary ports:
 	 * the explicit connection is the user's assertion that this is a 1697.
-	 * GMAX/GETS/GETD/GPAL only establish protocol plausibility, not identity. */
+	 * GMAX/GETS/GETD/GPAL/GOVP establish plausibility, not identity. */
 	if (!conn || !*conn)
 		return NULL;
 
@@ -171,6 +172,11 @@ static int config_get(uint32_t key, GVariant **data,
 		ret = bk1697_get(sdi, BK1697_GETS, &r);
 		if (ret == SR_OK)
 			*data = g_variant_new_double(key == SR_CONF_VOLTAGE_TARGET ? r.voltage : r.current);
+		break;
+	case SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD:
+		ret = bk1697_get(sdi, BK1697_GOVP, &r);
+		if (ret == SR_OK)
+			*data = g_variant_new_double(r.voltage);
 		break;
 	case SR_CONF_VOLTAGE:
 	case SR_CONF_CURRENT:
@@ -227,6 +233,14 @@ static int config_set(uint32_t key, GVariant *data,
 				ret = SR_ERR_ARG;
 				break;
 			}
+			/* A fresh actual ceiling is required even during acquisition. */
+			ret = bk1697_query_group(sdi, BK1697_GOVP, &r);
+			if (ret != SR_OK)
+				break;
+			if (counts > (unsigned int)(r.voltage * 10.0 + 0.5)) {
+				ret = SR_ERR_ARG;
+				break;
+			}
 			g_snprintf(command, sizeof(command), "VOLT00%03u", counts);
 		} else {
 			maximum = MIN(5.0, devc->maximum.current);
@@ -237,6 +251,24 @@ static int config_set(uint32_t key, GVariant *data,
 			g_snprintf(command, sizeof(command), "CURR00%03u", counts);
 		}
 		group = BK1697_GETS;
+		ret = bk1697_query(sdi, command, BK1697_ACK, &r);
+		break;
+	case SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD:
+		value = g_variant_get_double(data);
+		if (!bk1697_setting(value, 1.0, devc->maximum.voltage, 10.0, &counts)) {
+			ret = SR_ERR_ARG;
+			break;
+		}
+		/* Lowering behavior is undocumented: never change target or output. */
+		ret = bk1697_query_group(sdi, BK1697_GETS, &r);
+		if (ret != SR_OK)
+			break;
+		if (counts < (unsigned int)(r.voltage * 10.0 + 0.5)) {
+			ret = SR_ERR_ARG;
+			break;
+		}
+		group = BK1697_GOVP;
+		g_snprintf(command, sizeof(command), "SOVP00%03u", counts);
 		ret = bk1697_query(sdi, command, BK1697_ACK, &r);
 		break;
 	case SR_CONF_ENABLED:
@@ -276,6 +308,8 @@ static int config_list(uint32_t key, GVariant **data,
 	const struct sr_dev_inst *sdi, const struct sr_channel_group *cg)
 {
 	struct dev_context *devc;
+	struct bk1697_response r;
+	int ret;
 
 	devc = sdi ? sdi->priv : NULL;
 	switch (key) {
@@ -284,11 +318,20 @@ static int config_list(uint32_t key, GVariant **data,
 		return STD_CONFIG_LIST(key, data, sdi, cg, scanopts, drvopts, devopts);
 	case SR_CONF_VOLTAGE_TARGET:
 	case SR_CONF_CURRENT_LIMIT:
+	case SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD:
 		if (!devc)
 			return SR_ERR_ARG;
+		if (key == SR_CONF_VOLTAGE_TARGET) {
+			ret = bk1697_get(sdi, BK1697_GOVP, &r);
+			if (ret != SR_OK)
+				return ret;
+		}
 		g_mutex_lock(&devc->cache_mutex);
 		if (key == SR_CONF_VOLTAGE_TARGET)
-			*data = std_gvar_min_max_step(1.0, MIN(40.0, devc->maximum.voltage), 0.1);
+			*data = std_gvar_min_max_step(1.0,
+				MIN(40.0, MIN(devc->maximum.voltage, r.voltage)), 0.1);
+		else if (key == SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD)
+			*data = std_gvar_min_max_step(1.0, devc->maximum.voltage, 0.1);
 		else
 			*data = std_gvar_min_max_step(0.01, MIN(5.0, devc->maximum.current), 0.01);
 		g_mutex_unlock(&devc->cache_mutex);
