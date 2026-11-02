@@ -128,6 +128,22 @@ static void panel_ovp(void)
 	g_assert_cmpint(bk1697_parse_reply(panel, 72, BK1697_PANEL, &r), ==, -1);
 }
 
+static void upper_voltage(void)
+{
+	struct bk1697_response r;
+	static const char *bad[] = { "40\rOK\r", "0402\rOK\r", "4x2\rOK\r",
+		"402\rNO\r", "402\r\nOK\r", "402\rOK\rX" };
+	size_t i;
+
+	r = complete("402\rOK\r", BK1697_UPPER_VOLTAGE);
+	g_assert_cmpfloat(r.voltage, ==, 40.2);
+	r = complete("010\rOK\r", BK1697_UPPER_VOLTAGE);
+	g_assert_cmpfloat(r.voltage, ==, 1.0);
+	for (i = 0; i < G_N_ELEMENTS(bad); i++)
+		g_assert_cmpint(bk1697_parse_reply(bad[i], strlen(bad[i]),
+			BK1697_UPPER_VOLTAGE, &r), ==, -1);
+}
+
 static void safe_settings(void)
 {
 	static const double bad_voltage[] = { -1, 0, 0.9, 40.1, 12.34, INFINITY, NAN };
@@ -167,6 +183,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/bk1697/manual-and-synthetic", manual_and_synthetic);
 	g_test_add_func("/bk1697/malformed", malformed);
 	g_test_add_func("/bk1697/panel-ovp", panel_ovp);
+	g_test_add_func("/bk1697/upper-voltage", upper_voltage);
 	g_test_add_func("/bk1697/safe-settings", safe_settings);
 	return g_test_run();
 }

@@ -2,23 +2,25 @@
 
 Select explicitly with `bkprecision-1697:conn=PORT`. The connection is fixed to
 9600 baud, 8N1, no flow control. No port enumeration or model-ID command exists:
-selecting this driver asserts the model; read-only GMAX/GETS/GETD/GPAL queries
+selecting this driver asserts the model; read-only GMAX/GETS/GETD/GPAL/GOVP queries
 check protocol plausibility. Only 1697 is advertised.
 
 Scan/open do not change settings, output, protection configuration or keypad
 state. Close stops acquisition without changing physical output. Only explicit
-configuration requests send VOLT, CURR or SOUT. Closing a frontend is not an
+configuration requests send VOLT, CURR, SOUT or SOVP. Closing a frontend is not an
 output-OFF operation.
 
 ## Capabilities and wire format
 
 - Voltage/current analog acquisition, sample/time limits, queried voltage target
-  and current limit, actual output state, CV/CC, and read-only `ovp_active`.
+  and current limit, actual output state, CV/CC, read-only `ovp_active`, and
+  read/write/list `ovp_threshold` (double, volts).
 - GMAX/GETS have three-digit V/I fields in 0.1 V / 0.01 A units. The observed
   `402502` maximum means 40.2 V / 5.02 A; readback retains this headroom.
-- Programming is restricted to nominal 1–40 V, step 0.1 V, and 0.01–5 A,
-  step 0.01 A, further restricted by GMAX. Nonfinite/off-step/out-of-range
-  requests are rejected, not silently rounded or clamped.
+- Voltage/current targets are restricted to nominal 1–40 V, step 0.1 V, and 0.01–5 A,
+  step 0.01 A, further restricted by GMAX; voltage is also restricted by GOVP.
+  Nonfinite/off-step/out-of-range requests are rejected, not silently rounded
+  or clamped.
 - Seven-digit GETD: three V digits /10, three I digits /100, mode 0=CV/1=CC.
   Captured nine-digit firmware: four V digits /100, four I digits /1000, mode.
   Voltage scaling agrees with GPAL; loaded nonzero-current scaling/CC accuracy
@@ -32,31 +34,67 @@ output-OFF operation.
   to 72 bytes. Transactions are serialized through the complete reply, with a
   two-second overall deadline and at most 500 ms per read/write call.
 
+## Upper programming limit, not adjustable tracking OVP
+
+The standard `SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD` key maps to the
+instrument's upper programming voltage ceiling (GOVP/SOVP, sometimes called UVL).
+It does **not** adjust the independent fixed tracking OVP, which trips when actual
+voltage exceeds the target by approximately 10%. Existing GPAL `ovp_active`
+remains the actual FAULT/OVP lamp state; it is not inferred from GOVP.
+
+- `GOVP00\r` replies `ddd\rOK\r`; `ddd / 10` is volts.
+- `SOVP00ddd\r` replies `OK\r`, followed by mandatory actual GOVP readback.
+- Threshold GET/SET/LIST uses double volts: **1.0 through GMAX voltage**, in
+  **0.1 V steps**. With observed GMAX=40.2 V, `SOVP00402\r` is legal so the
+  observed factory 40.2 V limit can be restored. Threshold is not capped at 40 V.
+- Voltage-target SET/LIST maximum is **min(40.0 V, GMAX voltage, GOVP)**. Each
+  target write queries fresh actual GOVP first, even with a fresh cache or during
+  acquisition, and rejects excess without sending VOLT or raising the ceiling.
+- Before a threshold write, fresh GETS is mandatory. A ceiling below the current
+  target is rejected with no SOVP, VOLT or output write; lowering behavior is
+  undocumented. Lower the target explicitly first. Equality is permitted.
+- Nonfinite, off-step and out-of-range inputs are rejected without mutating
+  commands. Invalid precision/envelope requests need no prequery. ACKs alone do
+  not establish actual settings: ignored writes leave actual readback in cache,
+  and failed readbacks fault rather than fabricating a threshold.
+- Periodic GOVP polls publish standard threshold metadata for front-panel
+  changes. Target LIST shares GOVP's cache (250 ms idle TTL, last actual snapshot
+  while acquiring); target SET always rechecks the wire. Protection against
+  concurrent front-panel changes between prequery and write cannot be atomic.
+
+There is **no OVP-enable operation** and no regulation setter: CV/CC is read-only.
+Memory slots, timers and key-lock functions have no matching standard keys here;
+no invented keys or operations are exposed. No scan/open/stop/close writes change
+protection, targets, output or keypad state.
+
 ## Conventional polling and cached getters
 
-The read-only probe seeds three complete response groups: GETD (measurements and
-regulation), GETS (setpoints), GPAL (output and OVP). During acquisition, getters
+The five-command read-only probe seeds four complete response groups: GETD
+(measurements and regulation), GETS (setpoints), GPAL (output and OVP-active),
+and GOVP (upper programming voltage limit). During acquisition, getters
 return the last validated group under a short cache lock, without waiting for
 serial I/O. Idle callers reuse a group for 250 ms; expired groups are queried.
 Snapshots are coherent per group, not atomic across separate getter calls.
 
 A per-device timer-only source polls at 10 ms scheduling intervals. GETD
-measurement slots alternate with GETS/GPAL refresh opportunities once those
+measurement slots alternate with GETS/GPAL/GOVP refresh opportunities once those
 status groups are at least 500 ms old. This timer is not command spacing or a
 100 Hz sample-rate promise. Only GETD increments the sample count. Actual rate
 and status age depend on wire time, device replies, and competing control calls.
 
 There is no blanket inter-command delay or artificial open quarantine. Open
 flushes queued input and performs the normal probe. VOLT/CURR setters confirm
-actual GETS readback; SOUT confirms GPAL. Requested values are never fabricated
-into the cache. During a setter, active getters can return the preceding actual
-snapshot until readback completes.
+actual GETS readback; SOUT confirms GPAL and SOVP confirms GOVP. Requested values
+are never fabricated into the cache. During a setter, active getters can return
+the preceding actual snapshot until readback completes.
 
 **Measured firmware turnaround:** GETS immediately after a VOLT ACK failed in
 7/30 physical trials, and immediately after CURR in 4/30. A 1 ms post-ACK wait
 passed 30/30 for each. Therefore only VOLT/CURR wait 1 ms before their GETS
 readback. SOUT001-to-GPAL passed 30/30 without a gap and is not delayed. This is
 observed compatibility handling, not a manufacturer timing specification.
+SOVP has no measured post-ACK timing yet and deliberately has **no delay** before
+mandatory GOVP readback; parent-owned direct 0 vs 1 ms measurements are pending.
 
 Wire transactions and lifecycle changes use a wire mutex; snapshots and local
 limits use a short cache mutex. Lock order is wire then cache. Cache access never

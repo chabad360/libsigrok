@@ -43,6 +43,10 @@ SR_PRIV int bk1697_parse_reply(const char *buf, size_t len, enum bk1697_reply ki
 		expected = 3;
 	} else {
 		switch (kind) {
+		case BK1697_UPPER_VOLTAGE:
+			if (width != 3)
+				return -1;
+			break;
 		case BK1697_VALUES:
 		case BK1697_OUTPUT:
 			if (width != 6)
@@ -88,7 +92,10 @@ SR_PRIV int bk1697_parse_reply(const char *buf, size_t len, enum bk1697_reply ki
 					return -1;
 				r.cc = buf[width - 1] == '1';
 			}
-			if (width == 9) {
+			if (kind == BK1697_UPPER_VOLTAGE) {
+				r.voltage = decimal(buf, 3) / 10.0;
+				r.voltage_digits = 1;
+			} else if (width == 9) {
 				/* Captured firmware: XX.XX V / X.XXX A. Nonzero
 				 * current scaling still needs physical load verification. */
 				r.voltage = decimal(buf, 4) / 100.0;
