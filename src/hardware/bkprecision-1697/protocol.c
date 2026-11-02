@@ -214,7 +214,7 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	 * wire mutex during any send. */
 	if (!bk1697_send_begin(sdi, generation))
 		return TRUE;
-	std_session_send_df_frame_begin(sdi);
+	std_session_send_frame_begin(sdi);
 	bk1697_send_done(sdi);
 	for (l = sdi->channels; l; l = l->next) {
 		ch = l->data;
@@ -239,7 +239,7 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	}
 	if (!bk1697_send_begin(sdi, generation))
 		return TRUE;
-	std_session_send_df_frame_end(sdi);
+	std_session_send_frame_end(sdi);
 	bk1697_send_done(sdi);
 	if (!bk1697_send_begin(sdi, generation))
 		return TRUE;
