@@ -1402,10 +1402,10 @@ static void test_upper_voltage_notifications(void)
 		g_variant_new_double(6)), !=, SR_OK);
 	wire.ignore_setting = FALSE;
 	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 5);
-	upper_notification_round(0);
+	upper_notification_round(1);
 	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
 		g_variant_new_double(4.1)), ==, SR_ERR_ARG);
-	upper_notification_round(0);
+	upper_notification_round(1);
 	wire.upper_voltage_count = 60;
 	/* A safety prequery updates GOVP even though the target write is rejected;
 	 * neither this query nor the following getter may consume the event. */
@@ -1417,10 +1417,47 @@ static void test_upper_voltage_notifications(void)
 	wire.upper_voltage_count = 80;
 	reconnect(); /* Complete probe reseeds initial state without an event. */
 	upper_notification_round(0);
-	g_assert_cmpuint(wire.upper_metas, ==, 3);
+	g_assert_cmpuint(wire.upper_metas, ==, 5);
 	g_assert_cmpuint(wire.ends, ==, 8);
 	g_assert_cmpuint(observer_ends, ==, wire.ends);
 	g_assert_cmpuint(wire.adds, ==, wire.removes);
+	teardown();
+}
+
+static void test_upper_voltage_edit_confirmation(void)
+{
+	unsigned int count;
+
+	setup();
+	g_assert_cmpint(set(SR_CONF_VOLTAGE_TARGET, g_variant_new_double(4.2)), ==, SR_OK);
+	new_session(0, 1200);
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(3)), ==, SR_ERR_ARG);
+	/* Only the safety GETS: no SOVP, VOLT, CURR or SOUT on rejection. */
+	g_assert_cmpuint(wire.commands->len, ==, count + 1);
+	g_assert_cmpstr(g_ptr_array_index(wire.commands, count), ==, "GETS00");
+	check_double(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD, 40.2);
+	upper_notification_round(1);
+	upper_notification_round(0);
+	/* Invalid attempts before guards coalesce, and survive stop/restart. */
+	count = wire.commands->len;
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(NAN)), ==, SR_ERR_ARG);
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(0)), ==, SR_ERR_ARG);
+	g_assert_cmpuint(wire.commands->len, ==, count);
+	stop_packet = SR_DF_HEADER;
+	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
+	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
+	g_assert_cmpuint(wire.upper_metas, ==, 1);
+	upper_notification_round(1);
+	/* An explicit no-op also confirms actual state exactly once. */
+	g_assert_cmpint(set(SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+		g_variant_new_double(40.2)), ==, SR_OK);
+	upper_notification_round(1);
+	upper_notification_round(0);
+	g_assert_cmpuint(wire.upper_metas, ==, 3);
 	teardown();
 }
 
@@ -1771,6 +1808,7 @@ int main(int argc, char **argv)
 	g_test_add_data_func("/bk1697/ovp-poll/activate-clear", GUINT_TO_POINTER(1), test_ovp_poll);
 	g_test_add_data_func("/bk1697/ovp-poll/callback-stop", GUINT_TO_POINTER(2), test_ovp_poll);
 	g_test_add_data_func("/bk1697/ovp-poll/callback-close", GUINT_TO_POINTER(3), test_ovp_poll);
+	g_test_add_func("/bk1697/upper-voltage-edit-confirmation", test_upper_voltage_edit_confirmation);
 	g_test_add_func("/bk1697/upper-voltage-notifications", test_upper_voltage_notifications);
 	g_test_add_data_func("/bk1697/upper-voltage-poll/change", GUINT_TO_POINTER(1), test_upper_voltage_poll);
 	g_test_add_data_func("/bk1697/upper-voltage-poll/callback-stop", GUINT_TO_POINTER(2), test_upper_voltage_poll);

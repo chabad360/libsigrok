@@ -63,10 +63,14 @@ remains the actual FAULT/OVP lamp state; it is not inferred from GOVP.
   Transport/framing readback failures still fault rather than fabricating a value.
 - Periodic GOVP polls publish standard threshold metadata only when actual volts
   differ from the last notified value. A complete successful probe seeds this
-  baseline; unchanged refreshes do not reset a frontend numeric edit. Setters and
-  ordinary reads update the actual cache without consuming pending notifications:
-  a successful changed write is reported once on a subsequent poll, while an
-  ignored write retaining the old actual value adds no event. The notified value
+  baseline; unchanged refreshes do not reset an uncommitted frontend numeric edit.
+  Every explicit threshold SET attempt schedules one actual-value confirmation on
+  the next normal GOVP poll, including no-op, ignored or rejected requests. Multiple
+  attempts before that poll coalesce. This rolls back an optimistic frontend edit
+  without sending setting/output writes for a rejected request. Zero in the
+  last-notified field marks pending confirmation (valid thresholds are >=1 V).
+  Ordinary reads and setter readbacks update the actual cache without consuming
+  pending notifications. The notified value
   advances only after packet reservation, so stop/restart cannot consume an
   undelivered change; reconnect probing reseeds it. This is independent of cache
   freshness and adds no command or wait.

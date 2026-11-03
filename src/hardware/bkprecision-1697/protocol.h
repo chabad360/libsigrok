@@ -27,7 +27,8 @@ struct dev_context {
 	GMutex mutex, cache_mutex;
 	gboolean cache_ready, cache_active;
 	struct bk1697_snapshot cache[BK1697_GROUPS];
-	/* Under cache_mutex; reads/setter readbacks must not consume notifications. */
+	/* Under cache_mutex; reads/readbacks do not consume notifications.
+	 * Zero means pending explicit-edit confirmation (valid limits >=1 V). */
 	double notified_upper_voltage;
 	unsigned int refresh_group;
 	gboolean opened, faulted;
