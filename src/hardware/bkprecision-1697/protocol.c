@@ -184,6 +184,7 @@ SR_PRIV int bk1697_probe(const struct sr_dev_inst *sdi)
 	ret = bk1697_query_group(sdi, BK1697_GOVP, &r);
 	if (ret == SR_OK) {
 		g_mutex_lock(&devc->cache_mutex);
+		devc->notified_upper_voltage = r.voltage;
 		devc->cache_ready = TRUE;
 		g_mutex_unlock(&devc->cache_mutex);
 	}
@@ -278,7 +279,7 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 	struct sr_channel *ch;
 	GSList *l;
 	float value;
-	gboolean stop, end;
+	gboolean stop, end, changed;
 	uint64_t generation;
 	int ret;
 	enum bk1697_group group;
@@ -319,8 +320,16 @@ SR_PRIV int bk1697_receive_data(int fd, int revents, void *cb_data)
 		return TRUE;
 	if (group == BK1697_GOVP) {
 		if (bk1697_send_begin(sdi, generation)) {
-			sr_session_send_meta(sdi, SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
-				g_variant_new_double(r.voltage));
+			/* Reserve before consuming the change: a stopped generation must
+			 * leave it pending, even if a read/setter already cached it. */
+			g_mutex_lock(&devc->cache_mutex);
+			changed = r.voltage != devc->notified_upper_voltage;
+			if (changed)
+				devc->notified_upper_voltage = r.voltage;
+			g_mutex_unlock(&devc->cache_mutex);
+			if (changed)
+				sr_session_send_meta(sdi, SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD,
+					g_variant_new_double(r.voltage));
 			bk1697_send_done(sdi);
 		}
 		return TRUE;

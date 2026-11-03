@@ -61,8 +61,16 @@ remains the actual FAULT/OVP lamp state; it is not inferred from GOVP.
   fault, and permits a subsequent SET without reopening. This mismatch check is
   specific to the threshold; existing voltage/current setter behavior is unchanged.
   Transport/framing readback failures still fault rather than fabricating a value.
-- Periodic GOVP polls publish standard threshold metadata for front-panel
-  changes. Target LIST shares GOVP's cache (250 ms idle TTL, last actual snapshot
+- Periodic GOVP polls publish standard threshold metadata only when actual volts
+  differ from the last notified value. A complete successful probe seeds this
+  baseline; unchanged refreshes do not reset a frontend numeric edit. Setters and
+  ordinary reads update the actual cache without consuming pending notifications:
+  a successful changed write is reported once on a subsequent poll, while an
+  ignored write retaining the old actual value adds no event. The notified value
+  advances only after packet reservation, so stop/restart cannot consume an
+  undelivered change; reconnect probing reseeds it. This is independent of cache
+  freshness and adds no command or wait.
+  Target LIST shares GOVP's cache (250 ms idle TTL, last actual snapshot
   while acquiring); target SET always rechecks the wire. Protection against
   concurrent front-panel changes between prequery and write cannot be atomic.
 

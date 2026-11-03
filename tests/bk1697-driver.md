@@ -191,6 +191,73 @@ loaded CC scaling still require separate verification.
 Review was performed locally against the working-tree diff from `41b9dcc6`,
 using `HACKING` and the supplied spec; no agents or commits were used.
 
+## Threshold edit snapback regression (`136ea0a9`)
+
+Added `/bk1697/upper-voltage-notifications` **before** changing the driver and
+ran it against the existing unchanged `build-simplified` static archive. RED:
+**2 GOVP polls at unchanged actual 40.2 V emitted 2 threshold metadata packets,
+expected 0**; assertion failure, exit 134 (not timeout). This reproduces the
+redundant notification which makes SmuView's numeric field call `setValue` while
+editing. It is a public-API serial-fake live-acquisition regression, not a Qt or
+hardware test. Parent owns the actual installed-baseline/candidate Qt reproduction.
+
+The minimal fix adds one last-notified double, protected by the short cache lock.
+Successful complete probing seeds it from actual GOVP. Queries/setter readbacks
+still publish actual snapshots but never advance notified state. GOVP polling
+reserves a packet using the existing lifecycle helpers before comparing/updating
+that state, then delivers changed metadata unlocked. Stop/restart leaves pending
+changes intact; explicit reconnect reseeds initial actual state. No waits, SOVP
+turnaround changes, extra queries or frontend changes were added.
+
+GREEN, each round covering **2 normal GOVP refreshes**:
+
+| Actual/scenario | Threshold notifications |
+| --- | ---: |
+| Probe-known 40.2 V, unchanged | 0 |
+| Successful SET 5 V, cached getter, HEADER callback stop then restart | 1 |
+| Ignored SET 6 V, actual remains 5 V | 0 |
+| Rejected SET 4.1 V below target 4.2 V | 0 |
+| External 6 V, safety prequery already updates cache, then getter | 1 |
+| External 7 V through ordinary acquisition refresh | 1 |
+| Reconnect complete probe at 8 V | 0 |
+
+There are exactly **3 threshold packets** across seven live rounds and eight
+starts/stops; later-observer END ordering and source add/remove balance pass.
+Existing threshold change/callback-stop/callback-close cases already mutate fake
+actual GOVP (16/17 V), rather than depending on initial redundant metadata, and
+continue to pass alongside mandatory readback-fault and callback setter-fault
+coverage. The HEADER-stop check covers pending setter state across restart; the
+narrow query-to-reservation concurrent-stop window is protected by the existing
+generation reservation, not forced by a new test hook.
+
+Commands from the repository root (RED command was run before the build):
+
+```sh
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-notifications
+make -C build-simplified -j4
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-notifications
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 180 sh tests/bk1697-driver.sh
+LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+  make -C build-simplified check -j4
+git diff --check
+```
+
+Full GREEN: **44/44 integration** (all prior 43, including the prior 34),
+**6/6 parser/setting**, **76/76 upstream Check checks**, zero failures/errors.
+SOVP's 24-command no-delay guard measured **0.021 ms** total gaps; VOLT/CURR
+minimum waits remained **1.063/1.055 ms**, ten other gaps **0.034 ms** total.
+Held-wire getters took **0.047 ms**, held VOLT/SOVP setter getters
+**0.057/0.026 ms**, all with zero extra commands. Framing, limits, sample counts,
+fault handling and lifecycle guards remain passing and unchanged.
+
+Evidence: `build-simplified/threshold-notify-{red,green,build,driver-tests,check}.log`
+and `build-simplified/tests/{check_bkprecision_1697,main}.log`.
+Build ready: `build-simplified/.libs/libsigrok.so` and `.libs/libsigrok.a`.
+Only the five owned source/test/doc files changed; no hardware access, package
+changes, agents or commits, and `build-performance` was untouched.
+
 ## Test-first evidence
 
 Each new behavioral regression was run against the preceding implementation
