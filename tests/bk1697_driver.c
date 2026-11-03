@@ -1365,9 +1365,11 @@ static void test_upper_voltage_setting(void)
 /* Each round spans at least two normal GOVP refresh opportunities. */
 static void upper_notification_round(unsigned int expected)
 {
-	unsigned int i, polls = 0, count = wire.commands->len;
-	unsigned int before = wire.upper_metas;
+	unsigned int i, polls, count, before;
 
+	polls = 0;
+	count = wire.commands->len;
+	before = wire.upper_metas;
 	g_assert_cmpint(sr_session_start(session), ==, SR_OK);
 	g_assert_cmpint(sr_session_run(session), ==, SR_OK);
 	for (i = count; i < wire.commands->len; i++)
