@@ -254,6 +254,11 @@ static int config_set(uint32_t key, GVariant *data,
 		ret = bk1697_query(sdi, command, BK1697_ACK, &r);
 		break;
 	case SR_CONF_OVER_VOLTAGE_PROTECTION_THRESHOLD:
+		/* Confirm explicit edits once, even if validation rejects the request.
+		 * Valid limits are >=1 V; zero leaves the next actual poll pending. */
+		g_mutex_lock(&devc->cache_mutex);
+		devc->notified_upper_voltage = 0;
+		g_mutex_unlock(&devc->cache_mutex);
 		value = g_variant_get_double(data);
 		if (!bk1697_setting(value, 1.0, devc->maximum.voltage, 10.0, &counts)) {
 			ret = SR_ERR_ARG;

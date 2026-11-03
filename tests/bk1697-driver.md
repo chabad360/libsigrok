@@ -191,6 +191,65 @@ loaded CC scaling still require separate verification.
 Review was performed locally against the working-tree diff from `41b9dcc6`,
 using `HACKING` and the supplied spec; no agents or commits were used.
 
+## Explicit-edit confirmation follow-up
+
+Parent actual SmuView keyboard testing confirmed the original fix: typing 6 and
+waiting 1600 ms reverted to 40.2 on installed v3, but retained 6 on the candidate,
+without SOVP/VOLT/CURR/SOUT writes. Parent then found explicit rejected 3 V edits
+remained displayed despite actual target 4.2 V: the frontend optimistically emits
+the requested value even when SET fails. The earlier no-event expectations for
+ignored/rejected SETs below are historical and superseded by this follow-up.
+
+TDD: added public `/bk1697/upper-voltage-edit-confirmation` before source changes.
+RED against the prior candidate: rejected 3 V, actual threshold 40.2 V, **2 GOVP
+polls emitted 0 confirmations, expected 1**; assertion failure exit 134.
+The rejection issues exactly one safety GETS and **no setting/output writes**;
+GET still returns actual 40.2 V, never requested 3 V.
+
+Minimal fix: at threshold setter entry under the existing wire lock, before
+validation/guards, set `notified_upper_voltage = 0` under the short cache lock.
+Zero is a pending-explicit-edit sentinel because valid actual limits are >=1 V.
+The existing normal GOVP poll and packet reservation consume it only for delivery.
+No extra I/O, fields, waits or framework. Actual cache remains independent;
+readback faults still invalidate/stop without invented metadata. Multiple attempts
+coalesce; successful changes still produce one event, not confirmation plus change.
+
+GREEN new regression, each round containing two normal GOVP polls:
+
+- Rejected 3 V below actual target 4.2 V: **1 actual 40.2 V confirmation**.
+- Following unchanged round: **0**.
+- Two invalid attempts (NaN/0), zero commands, HEADER stop/restart: **1**.
+- Explicit successful no-op 40.2 V: **1**.
+- Following unchanged round: **0**.
+
+Updated notification regression: unchanged probe-known 40.2 V **0**; successful
+5 V **1**; ignored 6 V retaining actual 5 V **1**; rejected 4.1 V retaining 5 V
+**1**; actual external 6/7 V **1 each**; reconnect probe at 8 V **0**.
+
+Commands from repository root (focused RED ran before rebuilding):
+
+```sh
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-edit-confirmation
+make -C build-simplified -j4
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 30 \
+  sh tests/bk1697-driver.sh -p /bk1697/upper-voltage-edit-confirmation
+BK1697_BUILD_DIR="$PWD/build-simplified" timeout 180 sh tests/bk1697-driver.sh
+LD_LIBRARY_PATH=/home/mendel/Documents/Projects/drivers/.build-deps/check/usr/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} \
+  make -C build-simplified check -j4
+git diff --check
+```
+
+Full GREEN: **45/45 integration** (prior 44 plus new regression), **6/6 parser**,
+**76/76 upstream checks**, zero failures/errors. SOVP's undelayed 24-command guard
+measured **0.014 ms** total gaps. VOLT/CURR alone retain 1 ms waits (measured minima
+**1.063/1.062 ms**). Held-wire and held SOVP-ACK getters measured **0.037/0.024 ms**,
+zero extra commands; existing framing, guards, faults and lifecycle checks pass.
+Evidence: `build-simplified/explicit-edit-{red,green,build,driver-tests,check}.log`.
+Rebuilt shared/static libraries in `build-simplified/.libs/` are ready for parent
+GUI verification of both uncommitted editing and rejected-commit rollback.
+No hardware, agents, package changes or commits; `build-performance` untouched.
+
 ## Threshold edit snapback regression (`136ea0a9`)
 
 Added `/bk1697/upper-voltage-notifications` **before** changing the driver and
